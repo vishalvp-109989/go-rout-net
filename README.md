@@ -40,7 +40,7 @@ Key parameters can be adjusted directly in `main.go`:
 
 | Constant | Description | Default Value |
 | :--- | :--- | :--- |
-| `learning_rate` | Controls the step size for weight updates. | `0.00001` |
+| `learning_rate` | Controls the step size for weight updates. | `0.0001` |
 | `useCrossEntropy` | Toggles between **MSE (false)** and **Cross-Entropy (true)** loss. | `false` |
 | `K_CLASSES` | Number of classes for classification (only used with Cross-Entropy). | `1` |
 | `EPOCH` | Number of full passes over the training dataset. | `100` |
@@ -50,7 +50,7 @@ The network structure is defined in `main.go`:
 
 ```go
 network := NewNetwork(
-    Dense(m, n), // Input dimension setup
+    Dense(16, inputDim), // Input dimension setup
     Dense(8),    // First hidden layer with 8 neurons
     Dense(4),    // Second hidden layer with 4 neurons
     Dense(1),    // Output layer with 1 neuron (for regression)
