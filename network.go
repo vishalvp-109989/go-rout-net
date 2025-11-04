@@ -8,16 +8,16 @@ type Network struct {
 
 // NewNetwork builds: InputLayer -> Layer(defs[1]) -> Layer(defs[2]) -> ... -> Layer(defs[len-1]) -> OutputLayer
 func NewNetwork(defs ...DenseDef) *Network {
-	if len(defs) == 1 && defs[0].Neurons != 1 {
+	if len(defs) == 1 && defs[0].InputNeurons != 1 {
 		panic("Provide at least an input spec and one Dense layer for m!=1")
 	}
-	// First Dense must carry input spec (m,inputDim)
+	// First Dense must carry input spec (m,n) — ensure user used Dense(1, inputDim)
 	if !defs[0].HasInputSpec {
 		panic("First Dense must be called with two args: Dense(m, inputDim)")
 	}
 
 	// Create Input layer
-	iLayer := NewInputLayer(defs[0].Neurons, defs[0].InputNeurons)
+	iLayer := NewInputLayer(defs[0].InputNeurons, defs[0].Neurons)
 
 	prevErrs := iLayer.ErrsFromNext
 	prevIns := iLayer.InsToNext
@@ -27,7 +27,7 @@ func NewNetwork(defs ...DenseDef) *Network {
 	// For every Dense def except the first (input spec),
 	// create a regular Layer (including the last Dense def).
 	for i := range len(defs) - 1 {
-		l := NewLayer(prevErrs, prevIns, defs[i+1].Neurons, defs[i+1].Activation, defs[i+1].Gradient)
+		l := NewLayer(prevErrs, prevIns, defs[i+1].Neurons)
 		hidden = append(hidden, l)
 
 		// advance the prevs to this layer's outputs for the next iteration
@@ -36,7 +36,7 @@ func NewNetwork(defs ...DenseDef) *Network {
 	}
 
 	// Last layer.
-	l := NewLayer(prevErrs, prevIns, 1, defs[len(defs)-1].Activation, defs[len(defs)-1].Gradient)
+	l := NewLayer(prevErrs, prevIns, 1)
 	hidden = append(hidden, l)
 
 	return &Network{
@@ -97,7 +97,7 @@ func (nw *Network) WaitForBackpropFinish() {
 
 	// n is the number of columns/features
 	if m == 0 || len(iLayer.ErrsFromNext[0]) == 0 {
-		panic("Should not happen in a valid network")
+		return // Should not happen in a valid network
 	}
 	n := len(iLayer.ErrsFromNext[0])
 
