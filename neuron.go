@@ -8,7 +8,7 @@ import (
 const leak = 0.01
 
 var (
-	learningRate    = 0.0001
+	learningRate    = 0.0
 	channelCapacity = 1
 	batchSize       = 1
 )
