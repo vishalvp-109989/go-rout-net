@@ -1,4 +1,4 @@
-package main
+package data
 
 import (
 	"encoding/json"
@@ -189,7 +189,7 @@ func applyMinMax1D(x []float64, stats MinMaxStats) error {
 		return errors.New("dimension mismatch")
 	}
 
-	for j := 0; j < len(x); j++ {
+	for j := range x {
 		den := max[j] - min[j]
 		if den == 0 {
 			x[j] = 0

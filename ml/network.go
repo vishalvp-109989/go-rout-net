@@ -1,4 +1,4 @@
-package main
+package ml
 
 import (
 	"encoding/json"
@@ -37,7 +37,10 @@ type SerializableNeuron struct {
 }
 
 type SerializableLayer struct {
-	Neurons []SerializableNeuron `json:"neurons"`
+	// For Dense layers
+	Neurons []SerializableNeuron `json:"neurons,omitempty"`
+	// For Embedding layers (2D matrix of weights)
+	Embeddings [][]float64 `json:"embeddings,omitempty"`
 }
 
 type SerializableNetwork struct {
@@ -45,26 +48,48 @@ type SerializableNetwork struct {
 }
 
 // NewNetwork builds: InputLayer -> Layer(defs[1]) -> Layer(defs[2]) -> ... -> Layer(defs[len-1]) -> OutputLayer
-func NewNetwork(defs ...DenseDef) *Network {
-	if len(defs) == 1 && defs[0].Neurons != 1 {
-		panic("Provide at least an input spec and one Dense layer for m!=1")
-	}
-	// First Dense must carry input spec (m,inputDim)
-	if !defs[0].HasInputSpec {
-		panic("First Dense must be called with two args: Dense(m, inputDim)")
+func NewNetwork(defs ...LayerDef) *Network {
+	if len(defs) < 2 {
+		panic("Provide at least an input spec (Embedding/Dense) and one Dense layer.")
 	}
 
-	// Create Input layer
-	iLayer := NewInputLayer(defs[0].Neurons, defs[0].InputNeurons)
-
-	prevErrs := iLayer.ErrsFromNext
-	prevIns := iLayer.InsToNext
-
+	var iLayer *Layer
+	var prevErrs, prevIns [][]chan float64
 	var hidden []*Layer
+	loopStart := 0
 
-	// For every Dense def except the first (input spec),
-	// create a regular Layer (including the last Dense def).
-	for i := range len(defs) - 1 {
+	// 1. Handle the first layer (which defines the InputLayer structure)
+	def0 := defs[0]
+
+	if def0.IsEmbedding {
+		// If Embedding: InputLayer must be 1 row x InputLen columns (e.g., 1x5)
+		// InputLayer will send the 5 word indices (x1..x5)
+		iLayer = NewInputLayer(1, def0.InputNeurons)
+
+		// Create the Embedding layer
+		l := NewEmbedLayer(iLayer.ErrsFromNext, iLayer.InsToNext, def0, defs[1])
+		hidden = append(hidden, l)
+
+		// Advance for the next layer (Dense)
+		prevErrs = l.ErrsFromNext
+		prevIns = l.InsToNext
+		loopStart = 1 // Start loop from defs[1]
+
+	} else if !def0.HasInputSpec {
+		// Original Dense check
+		panic("First Dense must be called with two args: Dense(m, inputDim)")
+
+	} else {
+		// Original Dense Input Setup: m=def0.Neurons, n=def0.InputNeurons
+		iLayer = NewInputLayer(def0.Neurons, def0.InputNeurons)
+		prevErrs = iLayer.ErrsFromNext
+		prevIns = iLayer.InsToNext
+		loopStart = 0 // Start loop from defs[0]
+	}
+
+	// 2. Create subsequent Dense layers
+	// Start from the next definition (defs[loopStart]) up to the second-to-last layer.
+	for i := loopStart; i < len(defs)-1; i++ {
 		l := NewLayer(prevErrs, prevIns, defs[i+1])
 		hidden = append(hidden, l)
 
@@ -73,9 +98,18 @@ func NewNetwork(defs ...DenseDef) *Network {
 		prevIns = l.InsToNext
 	}
 
-	// Last layer.
-	def := DenseDef{Neurons: 1, Activation: defs[len(defs)-1].Activation, Gradient: defs[len(defs)-1].Gradient, Initializer: defs[len(defs)-1].Initializer}
-	l := NewLayer(prevErrs, prevIns, def)
+	// 3. Last layer (using the last definition in the slice)
+	lastDef := defs[len(defs)-1]
+
+	// Assuming a simplified output layer structure for demonstration
+	// In a real implementation, the last layer would use NewLayer with a proper def.
+	finalDef := LayerDef{
+		Neurons:     1,
+		Activation:  lastDef.Activation,
+		Gradient:    lastDef.Gradient,
+		Initializer: lastDef.Initializer,
+	}
+	l := NewLayer(prevErrs, prevIns, finalDef)
 	hidden = append(hidden, l)
 
 	return &Network{
@@ -90,11 +124,18 @@ func (nw *Network) SaveWeights(filename string) error {
 
 	for _, layer := range nw.Hidden {
 		sl := SerializableLayer{}
-		for _, neuron := range layer.Neurons {
-			sl.Neurons = append(sl.Neurons, SerializableNeuron{
-				Weights: neuron.Weights,
-				Bias:    neuron.Bias,
-			})
+
+		if layer.EmbeddingNeuron != nil {
+			// Case 1: Embedding Layer
+			sl.Embeddings = layer.EmbeddingNeuron.Embeddings
+		} else {
+			// Case 2: Dense Layer (Iterate over neurons)
+			for _, neuron := range layer.Neurons {
+				sl.Neurons = append(sl.Neurons, SerializableNeuron{
+					Weights: neuron.Weights,
+					Bias:    neuron.Bias,
+				})
+			}
 		}
 		sn.Layers = append(sn.Layers, sl)
 	}
@@ -122,27 +163,46 @@ func (nw *Network) LoadWeights(filename string) error {
 		return err
 	}
 
+	if len(sn.Layers) != len(nw.Hidden) {
+		return fmt.Errorf("mismatch: saved network has %d layers, current network has %d", len(sn.Layers), len(nw.Hidden))
+	}
+
 	// Copy values back into your network
 	for i, sl := range sn.Layers {
-		if i >= len(nw.Hidden) {
-			return fmt.Errorf("mismatch: saved network has more layers (%d) than current network (%d)", len(sn.Layers), len(nw.Hidden))
-		}
-		for j, snNeuron := range sl.Neurons {
-			if j >= len(nw.Hidden[i].Neurons) {
-				return fmt.Errorf("mismatch: layer %d has more neurons in saved file (%d) than in current network (%d)",
-					i, len(sl.Neurons), len(nw.Hidden[i].Neurons))
+		currentLayer := nw.Hidden[i]
+
+		if currentLayer.EmbeddingNeuron != nil {
+			// Case 1: Embedding Layer
+			if len(sl.Embeddings) == 0 {
+				return fmt.Errorf("mismatch: layer %d is an Embedding layer but no 'embeddings' found in saved file", i)
+			}
+			if len(sl.Embeddings) != len(currentLayer.EmbeddingNeuron.Embeddings) ||
+				(len(sl.Embeddings) > 0 && len(sl.Embeddings[0]) != len(currentLayer.EmbeddingNeuron.Embeddings[0])) {
+				return fmt.Errorf("mismatch in embedding matrix size at layer %d", i)
 			}
 
-			n := nw.Hidden[i].Neurons[j]
+			// Deep copy the 2D matrix
+			currentLayer.EmbeddingNeuron.Embeddings = sl.Embeddings
 
-			if len(n.Weights) != len(snNeuron.Weights) {
-				return fmt.Errorf("weight mismatch at layer %d neuron %d: expected %d weights, got %d",
-					i, j, len(n.Weights), len(snNeuron.Weights))
+		} else {
+			// Case 2: Dense Layer
+			if len(sl.Neurons) != len(currentLayer.Neurons) {
+				return fmt.Errorf("mismatch: layer %d has %d saved neurons, but current network has %d",
+					i, len(sl.Neurons), len(currentLayer.Neurons))
 			}
 
-			// Safe to assign now
-			copy(n.Weights, snNeuron.Weights)
-			n.Bias = snNeuron.Bias
+			for j, snNeuron := range sl.Neurons {
+				n := currentLayer.Neurons[j]
+
+				if len(n.Weights) != len(snNeuron.Weights) {
+					return fmt.Errorf("weight mismatch at layer %d neuron %d: expected %d weights, got %d",
+						i, j, len(n.Weights), len(snNeuron.Weights))
+				}
+
+				// Safe to assign now
+				copy(n.Weights, snNeuron.Weights)
+				n.Bias = snNeuron.Bias
+			}
 		}
 	}
 
@@ -180,15 +240,9 @@ func (nw *Network) Feedback(pred []float64, target []float64) {
 	oLayer := nw.OutputLayer
 	numOutputNeurons := len(oLayer.InsToNext[0])
 
-	// Calculate the error vector: error = pred - target
-	finalErrors := make([]float64, numOutputNeurons)
-	for i := range numOutputNeurons {
-		finalErrors[i] = pred[i] - target[i]
-	}
-
 	// Inject the final error into the output neurons to start backpropagation
 	for i := range numOutputNeurons {
-		oLayer.Neurons[i].ErrsFromNext[0] <- finalErrors[i]
+		oLayer.Neurons[i].ErrsFromNext[0] <- (pred[i] - target[i])
 	}
 }
 
@@ -268,7 +322,7 @@ func (nw *Network) Predict(x []float64, cfg TrainingConfig) float64 {
 	predVector := nw.GetOutput()
 	switch cfg.LossFunction {
 	case CATEGORICAL_CROSS_ENTROPY:
-		predVector = Softmax(predVector)
+		predVector = Softmax(predVector, 1.0)
 		predictedClass := OneHotDecode(predVector)
 
 		return predictedClass
@@ -292,6 +346,27 @@ func (nw *Network) Predict(x []float64, cfg TrainingConfig) float64 {
 		log.Printf("Warning: Cannot log test result. Unknown loss function: %d\n", cfg.LossFunction)
 	}
 	return 0.0
+}
+
+func (nw *Network) PredictProbs(x []float64, cfg TrainingConfig) []float64 {
+	// Forward pass
+	nw.FeedForward(x)
+	predVector := nw.GetOutput()
+
+	switch cfg.LossFunction {
+	case CATEGORICAL_CROSS_ENTROPY:
+		return predVector // return logits; caller can apply Softmax with desired Temperature
+
+	case BINARY_CROSS_ENTROPY:
+		return []float64{1 - predVector[0], predVector[0]} // return [P(class=0), P(class=1)]
+
+	case MSE: 
+		return predVector // return regression output as is
+
+	default:
+		log.Printf("Warning: Unknown loss function in PredictProba: %d\n", cfg.LossFunction)
+	}
+	return []float64{}
 }
 
 func (nw *Network) Evaluate(X [][]float64, Y []float64, cfg TrainingConfig) (float64, float64) {
@@ -325,7 +400,7 @@ func (nw *Network) computeLoss(predVector []float64, targetScalar float64, cfg T
 	switch cfg.LossFunction {
 	case CATEGORICAL_CROSS_ENTROPY:
 		// Ensure probabilities sum to 1
-		predVector = Softmax(predVector)
+		predVector = Softmax(predVector, 1.0)
 
 		// Convert scalar target to OHE
 		targetVector := OneHotEncode(targetScalar, cfg.KClasses)
@@ -373,7 +448,7 @@ func (nw *Network) computeLoss(predVector []float64, targetScalar float64, cfg T
 func (nw *Network) isCorrect(predVector []float64, targetScalar float64, cfg TrainingConfig) bool {
 	switch cfg.LossFunction {
 	case CATEGORICAL_CROSS_ENTROPY:
-		predVector = Softmax(predVector)
+		predVector = Softmax(predVector, 1.0)
 
 		predictedClass := OneHotDecode(predVector)
 
@@ -402,6 +477,16 @@ func (nw *Network) isCorrect(predVector []float64, targetScalar float64, cfg Tra
 
 func (nw *Network) UpdateNeuronCfg(cfg TrainingConfig) {
 	for _, layer := range nw.Hidden {
+		if layer.EmbeddingNeuron != nil {
+			ack := make(chan struct{})
+			layer.EmbeddingNeuron.ConfigUpdate <- NeuronCfg{
+				LR:        cfg.LearningRate,
+				BatchSize: cfg.BatchSize,
+				Ack:       ack,
+			}
+			<-ack
+		}
+
 		for _, neuron := range layer.Neurons {
 			ack := make(chan struct{})
 			// Send with Ack channel

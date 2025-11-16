@@ -1,6 +1,8 @@
 package main
 
 import (
+	. "go_rout_net/data"
+	. "go_rout_net/ml"
 	"log"
 	"os"
 	"os/signal"
@@ -8,12 +10,20 @@ import (
 )
 
 func main() {
-	X, Y, err := LoadCSV("mnist_train.csv")
+	embedDim := 4
+	contextLen := 5
+
+	vocabSize, wordToID, idToWord := CleanData(contextLen, 1, "assets/input.txt", "assets/")
+	log.Println("✅ Vocabulary size:", vocabSize)
+
+	outputDim := contextLen * embedDim
+
+	X, Y, err := LoadCSV("assets/dataset.csv")
 	if err != nil {
 		log.Println("Error:", err)
 		return
 	}
-	MinMaxNormalize(X)
+	// MinMaxNormalize(X)
 
 	inputDim := len(X[0])
 	numSamples := len(X)
@@ -21,14 +31,14 @@ func main() {
 	log.Printf("Loaded dataset: %d samples, %d input features\n", numSamples, inputDim)
 
 	nw := NewNetwork(
-		Dense(64, InputDim(inputDim), Activation("relu"), Initializer("he")),
-		Dense(32, Activation("relu")),
-		Dense(16, Activation("relu")),
-		Dense(10),
+		Embedding(embedDim, VocabSize(vocabSize), OutputDim(outputDim)),
+		Dense(128, Activation("relu")),
+		Dense(64, Activation("relu")),
+		Dense(vocabSize),
 	)
 
 	// Try to load previous weights if file exists
-	if err := nw.LoadWeights("weights.json"); err != nil {
+	if err := nw.LoadWeights("assets/weights.json"); err != nil {
 		log.Println("Error loading weights:", err)
 	}
 
@@ -39,7 +49,7 @@ func main() {
 	go func() {
 		<-c
 		log.Println("\nSaving weights before exit...")
-		if err := nw.SaveWeights("weights.json"); err != nil {
+		if err := nw.SaveWeights("assets/weights.json"); err != nil {
 			log.Println("Error saving weights:", err)
 		} else {
 			log.Println("Weights saved successfully.")
@@ -48,38 +58,35 @@ func main() {
 	}()
 
 	cfg := TrainingConfig{
-		Epochs:       10,
+		Epochs:       500,
 		BatchSize:    1,
 		LearningRate: 0.01,
 		LossFunction: CATEGORICAL_CROSS_ENTROPY,
-		KClasses:     10, // For CATEGORICAL_CROSS_ENTROPY (Softmax Output).
-		VerboseEvery: 1,
+		KClasses:     vocabSize, // For CATEGORICAL_CROSS_ENTROPY (Softmax Output).
+		VerboseEvery: 100,
 	}
 
 	// Train
 	nw.Train(X, Y, cfg)
 
-	// Evaluate
-	X, Y, err = LoadCSV("mnist_test.csv")
-	if err != nil {
-		log.Println("Error:", err)
-		return
+	/* T=1 The model is most predictable. */
+	/* T<1 Output is conservative, predictable, and repetitive. The model is highly confident in its top choice. Good for factual answers. */
+	/* T>1 Output is creative, diverse, and surprising. The model is more likely to pick lower-ranked, less common words, leading to combinations not in the training set. */
+	/* T->0 Always picks the single most probable word. Completely deterministic. */
+	/* T->∞ Approaches random selection. */
+	decodingCfg := DecodingConfig{
+		Mode:         ModeAlwaysSample,
+		SamplingType: SamplingGreedy,
+		Temperature:  1,
+		TopK:         5,
+		Interval:     5, // Sample on token 0, 10, 20, 30, 40
 	}
-	MinMaxNormalize(X)
-	loss, acc := nw.Evaluate(X, Y, cfg)
-	log.Printf("Final Evaluation: Loss=%.6f, Accuracy=%.2f%%", loss, acc)
 
-	// Predict
-	test, err := convertJpg1D("predict.jpg")
-	if err != nil {
-		panic("convertJpg1D failed")
-	}
-	NormalizeSampleMinMax(test)
-	pred := nw.Predict(test, cfg)
-	log.Printf("Predicted Output: %.4f | Actual Output: %.4f\n", pred, 5.0)
+	// Inference
+	Inference(nw, cfg, decodingCfg, contextLen, wordToID, idToWord)
 
 	// Save weights
-	if err := nw.SaveWeights("weights.json"); err != nil {
+	if err := nw.SaveWeights("assets/weights.json"); err != nil {
 		log.Println("Error saving weights:", err)
 	} else {
 		log.Println("Weights saved successfully.")

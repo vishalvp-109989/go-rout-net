@@ -24,7 +24,7 @@ This project is an educational exploration of how Go's concurrency primitives ca
 
 ### Prerequisites
 
-* Go (version 1.18 or later recommended)
+* Go (version 1.24 or later recommended)
 
 ### Installation
 

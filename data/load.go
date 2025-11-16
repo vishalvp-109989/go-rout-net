@@ -1,15 +1,11 @@
-package main
+package data
 
 import (
 	"encoding/csv"
 	"fmt"
-	"image/jpeg"
-	"math"
-	"math/rand"
 	"os"
 	"sort"
 	"strconv"
-	"time"
 )
 
 // LoadCSV reads a CSV file and returns numeric features X and target Y.
@@ -101,114 +97,4 @@ func LoadCSV(filename string) ([][]float64, []float64, error) {
 	}
 
 	return X, Y, nil
-}
-
-func Transpose(matrix [][]chan float64) [][]chan float64 {
-	if len(matrix) == 0 {
-		return [][]chan float64{}
-	}
-
-	rows := len(matrix)
-	cols := len(matrix[0])
-
-	// Create transposed matrix with swapped dimensions
-	transposed := make([][]chan float64, cols)
-	for i := range transposed {
-		transposed[i] = make([]chan float64, rows)
-	}
-
-	// Swap rows and columns
-	for i := range rows {
-		for j := range cols {
-			transposed[j][i] = matrix[i][j]
-		}
-	}
-
-	return transposed
-}
-
-func Softmax(activations []float64) []float64 {
-	expSum := 0.0
-	for _, a := range activations {
-		expSum += math.Exp(a)
-	}
-	out := make([]float64, len(activations))
-	for i, a := range activations {
-		out[i] = math.Exp(a) / expSum
-	}
-	return out
-}
-
-// Convert to One Hot Encoding
-func OneHotEncode(x float64, dim int) []float64 {
-	targetVector := make([]float64, dim)
-	if x >= 0 && x < float64(dim) {
-		targetVector[int(x)] = 1.0
-	}
-	return targetVector
-}
-
-func OneHotDecode(v []float64) float64 {
-	maxIndex := 0
-	maxValue := v[0]
-	for i, val := range v {
-		if val > maxValue {
-			maxValue = val
-			maxIndex = i
-		}
-	}
-	return float64(maxIndex)
-}
-
-// convertJpg1D reads an image file, converts to grayscale if needed,
-// flattens it row-major, and returns []float64
-func convertJpg1D(path string) ([]float64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	img, err := jpeg.Decode(f)
-	if err != nil {
-		return nil, err
-	}
-
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-
-	out := make([]float64, 0, w*h)
-
-	for y := range h {
-		for x := range w {
-			r, g, b, _ := img.At(x, y).RGBA()
-
-			gray := 0.299*float64(r>>8) +
-				0.587*float64(g>>8) +
-				0.114*float64(b>>8)
-
-			out = append(out, gray)
-		}
-	}
-
-	return out, nil
-}
-
-// Shuffle shuffles X and Y using the same permutation.
-// Returns the shuffled slices.
-func Shuffle(X [][]float64, Y []float64) ([][]float64, []float64) {
-	rand.Seed(time.Now().UnixNano())
-	n := len(X)
-
-	for i := range X {
-		j := rand.Intn(n)
-
-		// swap X
-		X[i], X[j] = X[j], X[i]
-
-		// swap Y
-		Y[i], Y[j] = Y[j], Y[i]
-	}
-
-	return X, Y
 }
