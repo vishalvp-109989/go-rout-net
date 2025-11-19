@@ -10,6 +10,8 @@ import (
 
 // LoadCSV reads a CSV file and returns numeric features X and target Y.
 // It automatically converts categorical (string) features into one-hot encoded vectors.
+// It assumes the last column is the target variable.
+// It skips the header row.
 func LoadCSV(filename string) ([][]float64, []float64, error) {
 	file, err := os.Open(filename)
 	if err != nil {

@@ -226,7 +226,7 @@ func Inference(
 			fmt.Print(" ", word)
 
 			// Stop when punctuation appears
-			if i > 10 && (word == "." || word == "?" || word == "!") {
+			if (word == "." || word == "?" || word == "!") {
 				break
 			}
 

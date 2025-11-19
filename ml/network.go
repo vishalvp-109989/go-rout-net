@@ -289,11 +289,11 @@ func (nw *Network) Train(X [][]float64, Y []float64, cfg TrainingConfig) {
 			pred := nw.GetOutput()
 
 			// 2. Compute loss
-			loss, targetVector := nw.computeLoss(pred, target, cfg)
+			loss, predVector, targetVector := nw.computeLoss(pred, target, cfg)
 			totalLoss += loss
 
 			// 3. Backward pass
-			nw.Feedback(pred, targetVector)
+			nw.Feedback(predVector, targetVector)
 			nw.WaitForBackpropFinish()
 
 			// 4. Accuracy Check
@@ -328,7 +328,7 @@ func (nw *Network) Predict(x []float64, cfg TrainingConfig) float64 {
 		return predictedClass
 
 	case BINARY_CROSS_ENTROPY:
-		predScalar := predVector[0] // Probability output
+		predScalar := sigmoid(predVector[0]) // Probability output
 
 		// Determine the binary class based on the 0.5 threshold
 		predictedClass := 0
@@ -358,9 +358,10 @@ func (nw *Network) PredictProbs(x []float64, cfg TrainingConfig) []float64 {
 		return predVector // return logits; caller can apply Softmax with desired Temperature
 
 	case BINARY_CROSS_ENTROPY:
-		return []float64{1 - predVector[0], predVector[0]} // return [P(class=0), P(class=1)]
+		p := sigmoid(predVector[0])
+		return []float64{1 - p, p} // return [P(class=0), P(class=1)]
 
-	case MSE: 
+	case MSE:
 		return predVector // return regression output as is
 
 	default:
@@ -383,7 +384,7 @@ func (nw *Network) Evaluate(X [][]float64, Y []float64, cfg TrainingConfig) (flo
 		pred := nw.GetOutput()
 
 		// 2. Compute loss
-		loss, _ := nw.computeLoss(pred, target, cfg)
+		loss, _, _ := nw.computeLoss(pred, target, cfg)
 		totalLoss += loss
 
 		// 3. Accuracy Check
@@ -396,7 +397,7 @@ func (nw *Network) Evaluate(X [][]float64, Y []float64, cfg TrainingConfig) (flo
 	return avgLoss, acc
 }
 
-func (nw *Network) computeLoss(predVector []float64, targetScalar float64, cfg TrainingConfig) (float64, []float64) {
+func (nw *Network) computeLoss(predVector []float64, targetScalar float64, cfg TrainingConfig) (float64, []float64, []float64) {
 	switch cfg.LossFunction {
 	case CATEGORICAL_CROSS_ENTROPY:
 		// Ensure probabilities sum to 1
@@ -417,10 +418,10 @@ func (nw *Network) computeLoss(predVector []float64, targetScalar float64, cfg T
 
 			loss += -y * math.Log(y_hat_safe)
 		}
-		return loss, targetVector
+		return loss, predVector, targetVector
 
 	case BINARY_CROSS_ENTROPY:
-		predScalar := predVector[0] // y_hat
+		predScalar := sigmoid(predVector[0]) // y_hat
 
 		// Add small epsilon to prevent log(0)
 		epsilon := 1e-15
@@ -434,11 +435,11 @@ func (nw *Network) computeLoss(predVector []float64, targetScalar float64, cfg T
 		loss := -(term1 + term2)
 
 		// Set targetVector
-		return loss, []float64{targetScalar}
+		return loss, []float64{predScalar}, []float64{targetScalar}
 
 	case MSE:
 		predScalar := predVector[0]
-		return 0.5 * math.Pow(predScalar-targetScalar, 2), []float64{targetScalar}
+		return 0.5 * math.Pow(predScalar-targetScalar, 2), predVector, []float64{targetScalar}
 
 	default:
 		panic(fmt.Sprintf("Unknown loss function: %d", cfg.LossFunction))
@@ -456,7 +457,7 @@ func (nw *Network) isCorrect(predVector []float64, targetScalar float64, cfg Tra
 		return float64(predictedClass) == targetScalar
 
 	case BINARY_CROSS_ENTROPY:
-		predScalar := predVector[0] // The single probability output by the Sigmoid layer
+		predScalar := sigmoid(predVector[0]) // The single probability output by the Sigmoid layer
 
 		// The predicted class is 1 if the probability is >= 0.5, otherwise 0.
 		predictedClass := 0
