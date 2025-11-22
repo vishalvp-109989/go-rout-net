@@ -4,16 +4,25 @@ import (
 	"fmt"
 )
 
+const (
+	LayerTypeDense LayerType = iota
+	LayerTypeEmbedding
+	LayerTypeLSTM
+)
+
 type LayerOption func(*LayerDef)
+type LayerType int
 
 type Layer struct {
 	Neurons         []*Neuron
+	LSTMNeurons     []*LSTMNeuron
 	EmbeddingNeuron *EmbeddingNeuron // Only one Embedding Block per Layer
 	ErrsFromNext    [][]chan float64
 	InsToNext       [][]chan float64
 }
 
 type LayerDef struct {
+	Type         LayerType // Add this field
 	InputNeurons int
 	Neurons      int
 	Activation   ActivationFunc
@@ -22,27 +31,17 @@ type LayerDef struct {
 	Initializer  InitializerFunc
 
 	// Embedding Specific Fields
-	IsEmbedding bool
-	EmbedDim    int
-	VocabSize   int
-	InputLen    int // Sequence length
-}
+	EmbedDim  int
+	VocabSize int
+	InputLen  int // InputLen to EmbeddingNeuron
 
-func VocabSize(size int) LayerOption {
-	return func(d *LayerDef) {
-		d.VocabSize = size
-	}
-}
-
-func OutputDim(dim int) LayerOption {
-	return func(d *LayerDef) {
-		d.Neurons = dim // Output size for the layer definition
-	}
+	// LSTM Specific Fields
+	Timesteps int // For LSTM layers
 }
 
 func Embedding(embedDim int, options ...LayerOption) LayerDef {
 	d := LayerDef{
-		IsEmbedding:  true,
+		Type:         LayerTypeEmbedding,
 		EmbedDim:     embedDim,
 		VocabSize:    0,
 		Neurons:      0,
@@ -69,6 +68,37 @@ func Embedding(embedDim int, options ...LayerOption) LayerDef {
 	return d
 }
 
+func VocabSize(size int) LayerOption {
+	return func(d *LayerDef) {
+		d.VocabSize = size
+	}
+}
+
+func OutputDim(dim int) LayerOption {
+	return func(d *LayerDef) {
+		d.Neurons = dim // Output size for the layer definition
+	}
+}
+
+func LSTM(neurons int, options ...LayerOption) LayerDef {
+	d := LayerDef{
+		Neurons:     neurons,
+		Initializer: Random,
+		Type:        LayerTypeLSTM,
+	}
+	// Apply all functional options
+	for _, opt := range options {
+		opt(&d)
+	}
+	return d
+}
+
+func Timesteps(timesteps int) LayerOption {
+	return func(d *LayerDef) {
+		d.Timesteps = timesteps
+	}
+}
+
 func Dense(neurons int, options ...LayerOption) LayerDef {
 	d := LayerDef{
 		Neurons:      neurons,
@@ -76,6 +106,7 @@ func Dense(neurons int, options ...LayerOption) LayerDef {
 		Gradient:     dfLinear, // Default derivative
 		HasInputSpec: false,
 		Initializer:  Random,
+		Type:         LayerTypeDense,
 	}
 
 	// Apply all functional options
@@ -142,7 +173,7 @@ func NewEmbedLayer(errsToPrev, outsFromPrev [][]chan float64, def0, def1 LayerDe
 	for i := range def1.Neurons {
 		insToNext[i] = make([]chan float64, outputNeurons)
 		for j := range outputNeurons {
-			insToNext[i][j] = make(chan float64, channelCapacity) // buffered
+			insToNext[i][j] = make(chan float64, ChannelCapacity) // buffered
 		}
 	}
 
@@ -151,7 +182,7 @@ func NewEmbedLayer(errsToPrev, outsFromPrev [][]chan float64, def0, def1 LayerDe
 		errsFromNext[i] = make([]chan float64, outputNeurons)
 		for j := range outputNeurons {
 			// Initialize channels to receive the final error signal from the first hidden layer
-			errsFromNext[i][j] = make(chan float64, channelCapacity)
+			errsFromNext[i][j] = make(chan float64, ChannelCapacity)
 		}
 	}
 	// Create the single Embedding block
@@ -178,7 +209,7 @@ func NewInputLayer(m, n int) *Layer {
 	for i := range m {
 		inToNext[i] = make([]chan float64, n)
 		for j := range n {
-			inToNext[i][j] = make(chan float64, channelCapacity) // buffered
+			inToNext[i][j] = make(chan float64, ChannelCapacity) // buffered
 		}
 	}
 
@@ -187,7 +218,7 @@ func NewInputLayer(m, n int) *Layer {
 		errsFromNext[i] = make([]chan float64, n)
 		for j := range n {
 			// Initialize channels to receive the final error signal from the first hidden layer
-			errsFromNext[i][j] = make(chan float64, channelCapacity)
+			errsFromNext[i][j] = make(chan float64, ChannelCapacity)
 		}
 	}
 	return &Layer{
@@ -196,9 +227,77 @@ func NewInputLayer(m, n int) *Layer {
 	}
 }
 
-func NewLayer(errsToPrev, outsFromPrev [][]chan float64, def LayerDef) *Layer {
+func NewHiddenLayer(errsToPrev, outsFromPrev [][]chan float64, defCurr, defNext LayerDef) *Layer {
+	// 1. Common Validation
+	if len(outsFromPrev) != defCurr.Neurons || len(errsToPrev) != defCurr.Neurons {
+		panic("Mismatch between provided channels and current layer neuron count")
+	}
+
+	if defCurr.Type == LayerTypeLSTM && defCurr.Timesteps != ChannelCapacity {
+		panic("LSTM layer's Timesteps must match ChannelCapacity")
+	}
+
+	numNeurons := defCurr.Neurons
+	outputNeurons := defNext.Neurons
+
+	// 2. Common Struct Initialization
+	layer := &Layer{
+		ErrsFromNext: make([][]chan float64, numNeurons),
+		InsToNext:    make([][]chan float64, numNeurons),
+	}
+
+	// 3. Pre-allocate specific neuron slices based on type
+	if defCurr.Type == LayerTypeLSTM {
+		layer.LSTMNeurons = make([]*LSTMNeuron, numNeurons)
+	} else {
+		layer.Neurons = make([]*Neuron, numNeurons)
+	}
+
+	// 4. Single Loop for Creation
+	for j := range numNeurons {
+		// A. Create Channels (Identical logic)
+		errsFromNext := make([]chan float64, outputNeurons)
+		insToNext := make([]chan float64, outputNeurons)
+
+		for i := range outputNeurons {
+			errsFromNext[i] = make(chan float64, ChannelCapacity)
+			insToNext[i] = make(chan float64, ChannelCapacity)
+		}
+
+		// B. Instantiate Specific Neuron
+		if defCurr.Type == LayerTypeLSTM {
+			layer.LSTMNeurons[j] = NewLSTMNeuron(
+				errsToPrev[j], outsFromPrev[j],
+				errsFromNext, insToNext,
+				defCurr.Timesteps, defCurr.Initializer,
+			)
+		} else {
+			layer.Neurons[j] = NewNeuron(
+				errsToPrev[j], outsFromPrev[j],
+				errsFromNext, insToNext,
+				defCurr.Activation, defCurr.Gradient, defCurr.Initializer,
+			)
+		}
+
+		// C. Assign Channels (Identical logic)
+		layer.ErrsFromNext[j] = errsFromNext
+		layer.InsToNext[j] = insToNext
+	}
+
+	// 5. Common Transpose
+	layer.ErrsFromNext = Transpose(layer.ErrsFromNext)
+	layer.InsToNext = Transpose(layer.InsToNext)
+
+	return layer
+}
+
+func NewOutputLayer(errsToPrev, outsFromPrev [][]chan float64, def LayerDef) *Layer {
+	if len(outsFromPrev) != def.Neurons || len(errsToPrev) != def.Neurons {
+		panic("Mismatch between provided channels and current layer neuron count")
+	}
+
 	numNeurons := len(outsFromPrev)
-	outputNeurons := def.Neurons
+	outputNeurons := 1
 	f := def.Activation
 	df := def.Gradient
 	weightsInit := def.Initializer
@@ -215,8 +314,8 @@ func NewLayer(errsToPrev, outsFromPrev [][]chan float64, def LayerDef) *Layer {
 		insToNext := make([]chan float64, outputNeurons)
 
 		for i := range outputNeurons {
-			errsFromNext[i] = make(chan float64, channelCapacity)
-			insToNext[i] = make(chan float64, channelCapacity)
+			errsFromNext[i] = make(chan float64, ChannelCapacity)
+			insToNext[i] = make(chan float64, ChannelCapacity)
 		}
 		layer.Neurons[j] = NewNeuron(errsToPrev[j], outsFromPrev[j], errsFromNext, insToNext, f, df, weightsInit)
 		layer.ErrsFromNext[j] = errsFromNext

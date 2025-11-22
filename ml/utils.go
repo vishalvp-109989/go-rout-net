@@ -3,7 +3,6 @@ package ml
 import (
 	"math"
 	"math/rand"
-	"time"
 )
 
 func Transpose(matrix [][]chan float64) [][]chan float64 {
@@ -30,16 +29,34 @@ func Transpose(matrix [][]chan float64) [][]chan float64 {
 	return transposed
 }
 
-func Softmax(activations []float64, T float64) []float64 {
-	expSum := 0.0
-	for _, a := range activations {
-		expSum += math.Exp(a/T)
+func Softmax(input []float64, temperature float64) []float64 {
+	// 1. Find the Maximum value in the input vector
+	maxVal := -math.MaxFloat64
+	for _, v := range input {
+		if v > maxVal {
+			maxVal = v
+		}
 	}
-	out := make([]float64, len(activations))
-	for i, a := range activations {
-		out[i] = math.Exp(a/T) / expSum
+
+	// 2. Calculate Exponentials subtracting maxVal (Stable Step)
+	// e^(x - max) is mathematically equivalent for Softmax but prevents overflow
+	output := make([]float64, len(input))
+	sum := 0.0
+
+	for i, v := range input {
+		// v - maxVal will always be <= 0, so Exp will result in 0.0 to 1.0
+		// It will NEVER be Infinity.
+		e := math.Exp((v - maxVal) / temperature)
+		output[i] = e
+		sum += e
 	}
-	return out
+
+	// 3. Normalize
+	for i := range output {
+		output[i] = output[i] / sum
+	}
+
+	return output
 }
 
 // Convert to One Hot Encoding
@@ -63,21 +80,18 @@ func OneHotDecode(v []float64) float64 {
 	return float64(maxIndex)
 }
 
-// Shuffle shuffles X and Y using the same permutation.
-// Returns the shuffled slices.
-func Shuffle(X [][]float64, Y []float64) ([][]float64, []float64) {
-	rand.Seed(time.Now().UnixNano())
-	n := len(X)
-
-	for i := range X {
-		j := rand.Intn(n)
-
-		// swap X
-		X[i], X[j] = X[j], X[i]
-
-		// swap Y
-		Y[i], Y[j] = Y[j], Y[i]
+// ShuffleGeneric shuffles two slices of any type (T and U) in sync.
+// It returns an error if slice lengths do not match.
+func Shuffle[T any, U any](x []T, y []U) error {
+	if len(x) != len(y) {
+		panic("slices must be of the same length")
 	}
 
-	return X, Y
+	// Use the standard library's shuffle helper
+	rand.Shuffle(len(x), func(i, j int) {
+		x[i], x[j] = x[j], x[i]
+		y[i], y[j] = y[j], y[i]
+	})
+
+	return nil
 }

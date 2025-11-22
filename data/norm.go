@@ -31,9 +31,9 @@ type ZScoreStats struct {
 }
 
 func init() {
-    // Remove old stats files (fresh start)
-    os.Remove("stats_minmax.json")
-    os.Remove("stats_zscore.json")
+	// Remove old stats files (fresh start)
+	os.Remove("stats_minmax.json")
+	os.Remove("stats_zscore.json")
 }
 
 //
@@ -98,7 +98,6 @@ func ComputeZScoreStats(X [][]float64) ZScoreStats {
 
 	return ZScoreStats{Mean: means, Std: stds}
 }
-
 
 //
 // ──────────────────────────────────────────────────────────────

@@ -32,6 +32,13 @@ const (
 	ModeIntervalSampling DecodingMode = "interval_sampling"
 )
 
+var endTokensInf = map[string]bool{
+	".":   false,
+	"?":   false,
+	"!":   false,
+	"eos": true,
+}
+
 // DecodingMode defines how frequently the configured SamplingType is used.
 type DecodingMode string
 
@@ -42,8 +49,9 @@ type DecodingConfig struct {
 	TopK         int     // The K value for Top-K sampling.
 
 	// New Fields for Mode Control
-	Mode     DecodingMode // Defines when to use the SamplingType
-	Interval int          // Used only if Mode is ModeIntervalSampling (e.g., 10)
+	Mode       DecodingMode // Defines when to use the SamplingType
+	Interval   int          // Used only if Mode is ModeIntervalSampling (e.g., 10)
+	Sequential bool         // Whether to use sequential inference (for LSTM)
 }
 
 // multinomialSample performs standard sampling from a probability distribution.
@@ -144,6 +152,12 @@ func Inference(
 	reader := bufio.NewReader(os.Stdin)
 
 	log.Printf("Decoding Mode: %+v\n", decodingCfg)
+	log.Printf("Prediction Model Type: %s\n", func() string {
+		if decodingCfg.Sequential {
+			return "Sequential (LSTM/RNN)"
+		}
+		return "Standard (Feed-Forward)"
+	}())
 
 	for {
 		fmt.Print("\nEnter text: ")
@@ -156,8 +170,9 @@ func Inference(
 		// 1. Tokenize input
 		words := strings.Fields(line)
 
-		// 2. Pad or trim to contextLen (using ID for UNK for padding)
+		// 2. Pad or trim to contextLen
 		if len(words) < contextLen {
+			// Pad with UNK ID's string representation ("<pad>")
 			pads := make([]string, contextLen-len(words))
 			for i := range pads {
 				pads[i] = PAD
@@ -167,7 +182,7 @@ func Inference(
 			words = words[len(words)-contextLen:] // keep last N words
 		}
 
-		// 3. Convert words → IDs
+		// 3. Convert words → IDs (float64 is often used for matrix math compatibility)
 		window := make([]float64, contextLen)
 		for i := range contextLen {
 			w := words[i]
@@ -178,32 +193,48 @@ func Inference(
 			window[i] = float64(id)
 		}
 
-		// fmt.Print("Generated: ", strings.Join(words, " "))
 		// 4. Generate next tokens
-		for i := range 50 {
-			// a) Get logits (raw output from NN)
-			logits := nw.PredictProbs(window, cfg)
+		maxTokens := 500 // Use the higher limit from InferenceSeq for maximum generation length
+		for i := range maxTokens {
+			var logits []float64
+
+			// a) Calculate logits based on model type (The core difference between the two original functions)
+			if decodingCfg.Sequential {
+				// SEQUENTIAL MODEL LOGIC (e.g., LSTM/RNN)
+				// 1. Reset the hidden state before processing the new sequence
+				nw.ResetLSTMState()
+
+				// 2. Pass sequence token by token to update state
+				for t := range len(window) {
+					x_t := []float64{window[t]}
+					// PredictProbs updates internal state and returns prediction for next token
+					logits = nw.PredictProbs(x_t, cfg)
+				}
+				// `logits` now holds the prediction based on the full sequence state
+			} else {
+				// STANDARD MODEL LOGIC (e.g., Feed-Forward)
+				// PredictProbs takes the whole context window at once
+				logits = nw.PredictProbs(window, cfg)
+			}
 
 			// b) Apply Softmax with Temperature
 			probs := Softmax(logits, decodingCfg.Temperature)
 
-			// c) Determine the sampling type for the current step based on the configured mode.
+			// c) Determine the sampling type for the current step
 			currentSamplingType := decodingCfg.SamplingType
 
 			switch decodingCfg.Mode {
 			case ModeSampleFirstThenGreedy:
-				// Case 2: Just first sampling → use decodecfg.SamplingType, then greedy
+				// Use sampling for the first token, then switch to greedy
 				if i > 0 {
 					currentSamplingType = SamplingGreedy
 				}
 			case ModeIntervalSampling:
-				// Case 3: Every N samples → use decodecfg.SamplingType, otherwise greedy
+				// Use sampling every N steps, otherwise greedy
 				if decodingCfg.Interval > 0 && i%decodingCfg.Interval != 0 {
 					currentSamplingType = SamplingGreedy
 				}
-			case ModeAlwaysSample:
-				// Case 1: For every Generate next token -> use decodecfg.SamplingType
-				// currentSamplingType is already set to decodingCfg.SamplingType
+				// case ModeAlwaysSample: currentSamplingType is already set to decodingCfg.SamplingType
 			}
 
 			var predID int
@@ -211,23 +242,24 @@ func Inference(
 			case SamplingGreedy:
 				predID = greedySample(probs)
 			case SamplingTopK:
-				// Temperature is applied in Softmax, then TopK masking is applied
 				predID = topKSample(probs, decodingCfg.TopK)
 			case SamplingUniform:
-				// Standard multinomial sampling
 				predID = multinomialSample(probs)
 			default:
-				// Fallback to Greedy
-				predID = greedySample(probs)
+				predID = greedySample(probs) // Fallback
 			}
 
 			// d) map ID → word
 			word := idToWord[predID]
-			fmt.Print(" ", word)
 
-			// Stop when punctuation appears
-			if (word == "." || word == "?" || word == "!") {
+			// Stop when end-of-sentence or end-of-sequence token appears
+			if endTokensInf[word] {
 				break
+			}
+
+			// Don't print padding and unknown tokens in the output
+			if word != PAD && word != UNK {
+				fmt.Print(" ", word)
 			}
 
 			// e) Slide window: drop first, append predicted ID

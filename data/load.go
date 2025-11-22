@@ -100,3 +100,63 @@ func LoadCSV(filename string) ([][]float64, []float64, error) {
 
 	return X, Y, nil
 }
+
+func LoadCSVSeq(filename string) ([][]float64, [][]float64, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	rows, err := reader.ReadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(rows) == 0 {
+		return nil, nil, nil
+	}
+
+	// Infer contextLen: total columns = 2*contextLen
+	numCols := len(rows[0])
+	if numCols%2 != 0 {
+		return nil, nil, fmt.Errorf("invalid dataset row width %d, expected even number", numCols)
+	}
+
+	contextLen := numCols / 2
+
+	var X [][]float64
+	var Y [][]float64
+
+	for _, row := range rows {
+
+		if len(row) != numCols {
+			return nil, nil, fmt.Errorf("row length mismatch: expected %d got %d", numCols, len(row))
+		}
+
+		xVals := make([]float64, contextLen)
+		yVals := make([]float64, contextLen)
+
+		for i := 0; i < contextLen; i++ {
+			v, err := strconv.ParseFloat(row[i], 64)
+			if err != nil {
+				return nil, nil, err
+			}
+			xVals[i] = v
+		}
+
+		for i := 0; i < contextLen; i++ {
+			v, err := strconv.ParseFloat(row[i+contextLen], 64)
+			if err != nil {
+				return nil, nil, err
+			}
+			yVals[i] = v
+		}
+
+		X = append(X, xVals)
+		Y = append(Y, yVals)
+	}
+
+	return X, Y, nil
+}

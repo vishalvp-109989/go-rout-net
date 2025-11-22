@@ -127,7 +127,7 @@ nw := NewNetwork(
     Dense(16, InputDim(inputDim), Activation("relu")),
     Dense(8, Activation("relu")),
     Dense(4, Activation("relu")),
-    Dense(1, Activation("sigmoid")), // Single neuron for binary probability
+    Dense(1), // Single neuron for binary probability
 )
 
 cfg := TrainingConfig{

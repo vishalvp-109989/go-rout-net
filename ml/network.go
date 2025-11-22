@@ -26,9 +26,11 @@ type TrainingConfig struct {
 	Epochs       int
 	BatchSize    int
 	LearningRate float64
+	ClipValue    float64
 	LossFunction int
 	KClasses     int
 	VerboseEvery int
+	ShuffleData  bool
 }
 
 type SerializableNeuron struct {
@@ -36,11 +38,17 @@ type SerializableNeuron struct {
 	Bias    float64   `json:"bias"`
 }
 
+type SerializableLSTM struct {
+	Weights [][]float64 `json:"weights"`
+	Biases  []float64   `json:"biases"`
+}
+
 type SerializableLayer struct {
 	// For Dense layers
 	Neurons []SerializableNeuron `json:"neurons,omitempty"`
 	// For Embedding layers (2D matrix of weights)
-	Embeddings [][]float64 `json:"embeddings,omitempty"`
+	Embeddings [][]float64        `json:"embeddings,omitempty"`
+	LSTMs      []SerializableLSTM `json:"lstms,omitempty"`
 }
 
 type SerializableNetwork struct {
@@ -61,7 +69,7 @@ func NewNetwork(defs ...LayerDef) *Network {
 	// 1. Handle the first layer (which defines the InputLayer structure)
 	def0 := defs[0]
 
-	if def0.IsEmbedding {
+	if def0.Type == LayerTypeEmbedding {
 		// If Embedding: InputLayer must be 1 row x InputLen columns (e.g., 1x5)
 		// InputLayer will send the 5 word indices (x1..x5)
 		iLayer = NewInputLayer(1, def0.InputNeurons)
@@ -90,7 +98,7 @@ func NewNetwork(defs ...LayerDef) *Network {
 	// 2. Create subsequent Dense layers
 	// Start from the next definition (defs[loopStart]) up to the second-to-last layer.
 	for i := loopStart; i < len(defs)-1; i++ {
-		l := NewLayer(prevErrs, prevIns, defs[i+1])
+		l := NewHiddenLayer(prevErrs, prevIns, defs[i], defs[i+1])
 		hidden = append(hidden, l)
 
 		// advance the prevs to this layer's outputs for the next iteration
@@ -99,17 +107,7 @@ func NewNetwork(defs ...LayerDef) *Network {
 	}
 
 	// 3. Last layer (using the last definition in the slice)
-	lastDef := defs[len(defs)-1]
-
-	// Assuming a simplified output layer structure for demonstration
-	// In a real implementation, the last layer would use NewLayer with a proper def.
-	finalDef := LayerDef{
-		Neurons:     1,
-		Activation:  lastDef.Activation,
-		Gradient:    lastDef.Gradient,
-		Initializer: lastDef.Initializer,
-	}
-	l := NewLayer(prevErrs, prevIns, finalDef)
+	l := NewOutputLayer(prevErrs, prevIns, defs[len(defs)-1])
 	hidden = append(hidden, l)
 
 	return &Network{
@@ -125,11 +123,22 @@ func (nw *Network) SaveWeights(filename string) error {
 	for _, layer := range nw.Hidden {
 		sl := SerializableLayer{}
 
-		if layer.EmbeddingNeuron != nil {
+		switch {
+		case layer.EmbeddingNeuron != nil:
 			// Case 1: Embedding Layer
 			sl.Embeddings = layer.EmbeddingNeuron.Embeddings
-		} else {
-			// Case 2: Dense Layer (Iterate over neurons)
+
+		case len(layer.LSTMNeurons) > 0:
+			// Case 2: LSTM Layer
+			for _, lstm := range layer.LSTMNeurons {
+				sl.LSTMs = append(sl.LSTMs, SerializableLSTM{
+					Weights: lstm.Weights,
+					Biases:  lstm.Biases,
+				})
+			}
+
+		default:
+			// Case 3: Dense Layer
 			for _, neuron := range layer.Neurons {
 				sl.Neurons = append(sl.Neurons, SerializableNeuron{
 					Weights: neuron.Weights,
@@ -137,6 +146,7 @@ func (nw *Network) SaveWeights(filename string) error {
 				})
 			}
 		}
+
 		sn.Layers = append(sn.Layers, sl)
 	}
 
@@ -164,42 +174,51 @@ func (nw *Network) LoadWeights(filename string) error {
 	}
 
 	if len(sn.Layers) != len(nw.Hidden) {
-		return fmt.Errorf("mismatch: saved network has %d layers, current network has %d", len(sn.Layers), len(nw.Hidden))
+		return fmt.Errorf("mismatch: saved network has %d layers, current network has %d",
+			len(sn.Layers), len(nw.Hidden))
 	}
 
-	// Copy values back into your network
 	for i, sl := range sn.Layers {
 		currentLayer := nw.Hidden[i]
 
-		if currentLayer.EmbeddingNeuron != nil {
-			// Case 1: Embedding Layer
+		switch {
+		case currentLayer.EmbeddingNeuron != nil:
+			// ===== Embedding =====
 			if len(sl.Embeddings) == 0 {
-				return fmt.Errorf("mismatch: layer %d is an Embedding layer but no 'embeddings' found in saved file", i)
+				return fmt.Errorf("layer %d expected embeddings but none found", i)
 			}
-			if len(sl.Embeddings) != len(currentLayer.EmbeddingNeuron.Embeddings) ||
-				(len(sl.Embeddings) > 0 && len(sl.Embeddings[0]) != len(currentLayer.EmbeddingNeuron.Embeddings[0])) {
-				return fmt.Errorf("mismatch in embedding matrix size at layer %d", i)
-			}
-
-			// Deep copy the 2D matrix
 			currentLayer.EmbeddingNeuron.Embeddings = sl.Embeddings
 
-		} else {
-			// Case 2: Dense Layer
-			if len(sl.Neurons) != len(currentLayer.Neurons) {
-				return fmt.Errorf("mismatch: layer %d has %d saved neurons, but current network has %d",
-					i, len(sl.Neurons), len(currentLayer.Neurons))
+		case len(currentLayer.LSTMNeurons) > 0:
+			// ===== LSTM =====
+			if len(sl.LSTMs) != len(currentLayer.LSTMNeurons) {
+				return fmt.Errorf("layer %d mismatch lstm count: saved=%d current=%d",
+					i, len(sl.LSTMs), len(currentLayer.LSTMNeurons))
 			}
 
-			for j, snNeuron := range sl.Neurons {
-				n := currentLayer.Neurons[j]
+			for j, saved := range sl.LSTMs {
+				lstm := currentLayer.LSTMNeurons[j]
 
-				if len(n.Weights) != len(snNeuron.Weights) {
-					return fmt.Errorf("weight mismatch at layer %d neuron %d: expected %d weights, got %d",
-						i, j, len(n.Weights), len(snNeuron.Weights))
+				// Check size
+				if len(saved.Weights) != len(lstm.Weights) ||
+					len(saved.Weights[0]) != len(lstm.Weights[0]) {
+					return fmt.Errorf("layer %d lstm %d weight size mismatch", i, j)
 				}
 
-				// Safe to assign now
+				// Deep copy
+				for r := range lstm.Weights {
+					copy(lstm.Weights[r], saved.Weights[r])
+				}
+				copy(lstm.Biases, saved.Biases)
+			}
+
+		default:
+			// ===== Dense =====
+			if len(sl.Neurons) != len(currentLayer.Neurons) {
+				return fmt.Errorf("mismatch: layer %d wrong neurons count", i)
+			}
+			for j, snNeuron := range sl.Neurons {
+				n := currentLayer.Neurons[j]
 				copy(n.Weights, snNeuron.Weights)
 				n.Bias = snNeuron.Bias
 			}
@@ -208,6 +227,26 @@ func (nw *Network) LoadWeights(filename string) error {
 
 	log.Println("Weights loaded successfully.")
 	return nil
+}
+
+func (nw *Network) LogAndSaveWeights(epoch int, totalLoss float64, correct int, limit int, start time.Time, cfg TrainingConfig) {
+	if epoch%cfg.VerboseEvery == 0 {
+		// Calculate metrics based on processed samples (limit)
+		avgLoss := totalLoss / float64(limit)
+		acc := float64(correct) / float64(limit) * 100.0
+		elapsed := time.Since(start).Minutes()
+
+		log.Printf("Epoch %d | Loss: %.6f | Accuracy: %.2f%% | Time: %.2f min\n", epoch, avgLoss, acc, elapsed)
+
+		if acc > 100.0 {
+			filename := fmt.Sprintf("assets/weights_epoch_%d_acc_%.2f.json", epoch, acc)
+			if err := nw.SaveWeights(filename); err != nil {
+				log.Println("Error saving weights:", err)
+			} else {
+				log.Println("Weights saved successfully.")
+			}
+		}
+	}
 }
 
 func (nw *Network) GetOutput() []float64 {
@@ -266,20 +305,51 @@ func (nw *Network) WaitForBackpropFinish() {
 	}
 }
 
-func (nw *Network) Train(X [][]float64, Y []float64, cfg TrainingConfig) {
+func (nw *Network) ResetLSTMState() {
+	for _, layer := range nw.Hidden {
+		for _, neuron := range layer.LSTMNeurons {
+			neuron.ResetState()
+		}
+	}
+}
+
+func (nw *Network) Train(X [][]float64, Y any, cfg TrainingConfig) {
+	// Log and Configuration Setup (Common to both)
 	log.Printf("Train: %+v", cfg)
 	nw.UpdateNeuronCfg(cfg)
 
 	start := time.Now()
 	dataSize := len(X)
 
+	// Calculate the limit for batch processing (Common to both)
 	limit := (dataSize / cfg.BatchSize) * cfg.BatchSize
-	log.Printf("Dropped %d samples", dataSize-limit)
+	if dataSize-limit > 0 {
+		log.Printf("Dropped %d samples (not enough for a full batch)", dataSize-limit)
+	}
 
+	// --- Core Logic Dispatcher (Type check only happens ONCE) ---
+	switch targets := Y.(type) {
+	case []float64:
+		nw.trainNonSequential(X, targets, cfg, limit, dataSize, start)
+	case [][]float64:
+		nw.trainSequential(X, targets, cfg, limit, dataSize, start)
+	default:
+		log.Fatalf("Unsupported target data type for Y: %T. Must be []float64 (non-sequential) or [][]float64 (sequential).", Y)
+	}
+}
+
+// --- Internal Training Functions ---
+
+// trainNonSequential handles standard, non-RNN training (Y is []float64).
+func (nw *Network) trainNonSequential(X [][]float64, Y []float64, cfg TrainingConfig, limit, dataSize int, start time.Time) {
 	for epoch := range cfg.Epochs {
 		totalLoss := 0.0
 		correct := 0
-		X, Y = Shuffle(X, Y)
+
+		if cfg.ShuffleData {
+			Shuffle(X, Y)
+		}
+
 		for i := range limit {
 			x := X[i]
 			target := Y[i]
@@ -301,19 +371,80 @@ func (nw *Network) Train(X [][]float64, Y []float64, cfg TrainingConfig) {
 				correct++
 			}
 		}
-		// Logging
-		if epoch%cfg.VerboseEvery == 0 {
-			avgLoss := totalLoss / float64(dataSize)
-			acc := float64(correct) / float64(dataSize) * 100.0
-			elapsed := time.Since(start).Minutes()
-			log.Printf("Epoch %d | Loss: %.6f | Accuracy: %.2f%% | Time: %.2f min\n", epoch, avgLoss, acc, elapsed)
 
-			// if err := nw.SaveWeights("weights.json"); err != nil {
-			// 	log.Println("Error saving weights:", err)
-			// } else {
-			// 	log.Println("Weights saved successfully.")
-			// }
+		// Logging and Saving Weights
+		nw.LogAndSaveWeights(epoch, totalLoss, correct, limit, start, cfg)
+	}
+}
+
+// trainSequential handles sequence (RNN/LSTM) training (Y is [][]float64).
+func (nw *Network) trainSequential(X [][]float64, Y [][]float64, cfg TrainingConfig, limit, dataSize int, start time.Time) {
+	if dataSize == 0 || len(X[0]) == 0 {
+		log.Println("Sequential training requires non-empty data with timesteps.")
+		return
+	}
+	timesteps := len(X[0])
+
+	// These slices store data across the sequence for backprop-through-time
+	predVecs := make([][]float64, timesteps)
+	targetVecs := make([][]float64, timesteps)
+
+	for epoch := range cfg.Epochs {
+		totalLoss := 0.0
+		correct := 0
+
+		if cfg.ShuffleData {
+			Shuffle(X, Y)
 		}
+
+		for i := range limit {
+			nw.ResetLSTMState()
+
+			Xseq := X[i]
+			Yseq := Y[i]
+
+			var lastPred []float64
+			var lastTarget float64
+
+			// Forward Pass (through time)
+			for t := range timesteps {
+				// We assume Xseq is a flattened sequence, so we take a single element for input
+				x_t := []float64{Xseq[t]}
+				target_t := Yseq[t]
+
+				// 1. Forward pass for timestep t
+				nw.FeedForward(x_t)
+				pred_t := nw.GetOutput()
+
+				// 2. Compute loss for timestep t
+				loss, predVector, targetVector := nw.computeLoss(pred_t, target_t, cfg)
+				totalLoss += loss
+
+				predVecs[t] = predVector
+				targetVecs[t] = targetVector
+
+				// Keep track of the last step for accuracy check
+				lastPred = pred_t
+				lastTarget = target_t
+			}
+
+			// 3. Backward Pass (through time)
+			for t := range timesteps {
+				nw.Feedback(predVecs[t], targetVecs[t])
+			}
+			// Wait for all backpropagation to finish
+			for range timesteps {
+				nw.WaitForBackpropFinish()
+			}
+
+			// 4. Accuracy Check (only on the final output of the sequence)
+			if nw.isCorrect(lastPred, lastTarget, cfg) {
+				correct++
+			}
+		}
+
+		// Logging and Saving Weights
+		nw.LogAndSaveWeights(epoch, totalLoss, correct, limit, start, cfg)
 	}
 }
 
@@ -483,6 +614,17 @@ func (nw *Network) UpdateNeuronCfg(cfg TrainingConfig) {
 			layer.EmbeddingNeuron.ConfigUpdate <- NeuronCfg{
 				LR:        cfg.LearningRate,
 				BatchSize: cfg.BatchSize,
+				Ack:       ack,
+			}
+			<-ack
+		}
+
+		for _, neuron := range layer.LSTMNeurons {
+			ack := make(chan struct{})
+			// Send with Ack channel
+			neuron.ConfigUpdate <- NeuronCfg{
+				LR:        cfg.LearningRate,
+				ClipValue: cfg.ClipValue,
 				Ack:       ack,
 			}
 			<-ack

@@ -12,18 +12,46 @@ import (
 func main() {
 	embedDim := 4
 	contextLen := 5
+	freqThreshold := 1 // Replace words with freq < threshold with <unk>
+	sequential := true // Whether to use sequential model (LSTM) or non-sequential (n-gram)
 
-	vocabSize, wordToID, idToWord := CleanData(contextLen, 1, "assets/input.txt", "assets/")
-	log.Println("✅ Vocabulary size:", vocabSize)
+	var outputDim, vocabSize int
+	var X [][]float64
+	var Y any
+	var err error
+	var wordToID map[string]int
+	var idToWord []string
 
-	outputDim := contextLen * embedDim
+	if sequential {
+		outputDim = embedDim
+		ChannelCapacity = contextLen // Adjust channel capacity based on context length for LSTM
 
-	X, Y, err := LoadCSV("assets/dataset.csv")
+		vocabSize, wordToID, idToWord = PreprocessSeqData(
+			contextLen,
+			freqThreshold,
+			"assets/input.txt",
+			"assets/",
+		)
+		X, Y, err = LoadCSVSeq("assets/dataset.csv")
+	} else {
+		outputDim = contextLen * embedDim // Output dimension for Embedding layer for non-sequential model(n-gram)
+
+		vocabSize, wordToID, idToWord = PreprocessNGramData(
+			contextLen,
+			freqThreshold,
+			"assets/input.txt",
+			"assets/",
+		)
+		X, Y, err = LoadCSV("assets/dataset.csv")
+	}
+
 	if err != nil {
-		log.Println("Error:", err)
+		log.Println("Error in Preprocess:", err)
 		return
 	}
 	// MinMaxNormalize(X)
+
+	log.Println("✅ Vocabulary size:", vocabSize)
 
 	inputDim := len(X[0])
 	numSamples := len(X)
@@ -32,7 +60,7 @@ func main() {
 
 	nw := NewNetwork(
 		Embedding(embedDim, VocabSize(vocabSize), OutputDim(outputDim)),
-		Dense(128, Activation("relu")),
+		LSTM(64, Timesteps(contextLen), Initializer("xavier")),
 		Dense(64, Activation("relu")),
 		Dense(vocabSize),
 	)
@@ -58,12 +86,14 @@ func main() {
 	}()
 
 	cfg := TrainingConfig{
-		Epochs:       500,
+		Epochs:       250,
 		BatchSize:    1,
 		LearningRate: 0.01,
+		ClipValue:    5.0,
 		LossFunction: CATEGORICAL_CROSS_ENTROPY,
 		KClasses:     vocabSize, // For CATEGORICAL_CROSS_ENTROPY (Softmax Output).
-		VerboseEvery: 100,
+		VerboseEvery: 10,
+		ShuffleData:  false,
 	}
 
 	// Train
@@ -79,7 +109,7 @@ func main() {
 		SamplingType: SamplingGreedy,
 		Temperature:  1,
 		TopK:         5,
-		Interval:     5, // Sample on token 0, 10, 20, 30, 40
+		Sequential:   sequential,
 	}
 
 	// Inference
