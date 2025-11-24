@@ -94,6 +94,7 @@ func main() {
 		KClasses:     vocabSize, // For CATEGORICAL_CROSS_ENTROPY (Softmax Output).
 		VerboseEvery: 10,
 		ShuffleData:  false,
+		MinAccToSave: 101,
 	}
 
 	// Train

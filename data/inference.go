@@ -33,10 +33,10 @@ const (
 )
 
 var endTokensInf = map[string]bool{
-	".":   false,
-	"?":   false,
-	"!":   false,
-	"eos": true,
+	".":   true,
+	"?":   true,
+	"!":   true,
+	"eos": false,
 }
 
 // DecodingMode defines how frequently the configured SamplingType is used.
@@ -253,7 +253,7 @@ func Inference(
 			word := idToWord[predID]
 
 			// Stop when end-of-sentence or end-of-sequence token appears
-			if endTokensInf[word] {
+			if word == "eos" {
 				break
 			}
 
@@ -264,6 +264,32 @@ func Inference(
 
 			// e) Slide window: drop first, append predicted ID
 			window = append(window[1:], float64(predID))
+
+			// 2. FULL STOP logic
+			if endTokensInf[word] {
+				fmt.Print("\n\nEnter text: ")
+
+				newLine, _ := reader.ReadString('\n')
+				newLine = strings.TrimSpace(strings.ToLower(newLine))
+
+				if newLine == "" {
+					break
+				}
+
+				newWords := strings.Fields(newLine)
+
+				// Append new text into window sliding
+				for _, w := range newWords {
+					id, ok := wordToID[w]
+					if !ok {
+						id = wordToID[UNK]
+					}
+					window = append(window[1:], float64(id))
+				}
+
+				// Continue generating based on updated window
+				continue
+			}
 
 			// Small delay for better UX
 			time.Sleep(100 * time.Millisecond)

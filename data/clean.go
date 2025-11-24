@@ -9,17 +9,16 @@ import (
 )
 
 var endTokens = map[string]bool{
-	".":   false,
+	".":   true,
 	"?":   false,
 	"!":   false,
-	"eos": true,
 }
 
 // -------------------------------------------------------------
 // Convert low-frequency words to <unk>
 // -------------------------------------------------------------
 func convertLowFreqsToUnk(freqThreshold int, text string, freq map[string]int) string {
-	reTok := regexp.MustCompile(`<[^>\s]+>|[a-z0-9]+|[.!?,]`)
+	reTok := regexp.MustCompile(`<[^>\s]+>|[a-z0-9]+|[.!?,]|🙂`)
 	words := reTok.FindAllString(text, -1)
 
 	out := make([]string, len(words))
@@ -230,13 +229,13 @@ func PreprocessSeqData(contextLen, freqThreshold int, filepath, outputDir string
 	// 2. Clean text
 	// --------------------------
 	text = strings.ReplaceAll(text, "'", "")
-	re := regexp.MustCompile(`[^a-z0-9.!?,<>-]+`)
+	re := regexp.MustCompile(`[^a-z0-9.!?,<>-\x{1F642}]+`)
 	text = re.ReplaceAllString(text, " ")
 	text = strings.Join(strings.Fields(text), " ")
 	_ = os.WriteFile(outputDir+"cleaned_data.txt", []byte(text), 0644)
 
 	// tokenizer
-	reTok := regexp.MustCompile(`<[^>\s]+>|[a-z0-9]+|[.!?,]`)
+	reTok := regexp.MustCompile(`<[^>\s]+>|[a-z0-9]+|[.!?,]|🙂`)
 	rawWords := reTok.FindAllString(text, -1)
 
 	// --------------------------

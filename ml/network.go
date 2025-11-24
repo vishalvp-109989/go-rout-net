@@ -23,14 +23,15 @@ type Network struct {
 }
 
 type TrainingConfig struct {
-	Epochs       int
-	BatchSize    int
-	LearningRate float64
-	ClipValue    float64
-	LossFunction int
-	KClasses     int
-	VerboseEvery int
-	ShuffleData  bool
+	Epochs       int     // Number of training epochs
+	BatchSize    int     // Number of samples per batch
+	LearningRate float64 // Learning rate for weight updates
+	ClipValue    float64 // For gradient clipping
+	LossFunction int     // MSE, CATEGORICAL_CROSS_ENTROPY, BINARY_CROSS_ENTROPY
+	KClasses     int     // For CATEGORICAL_CROSS_ENTROPY
+	VerboseEvery int     // How often to log progress (in epochs)
+	ShuffleData  bool    // Whether to shuffle data each epoch
+	MinAccToSave float64 // Minimum accuracy threshold to save weights
 }
 
 type SerializableNeuron struct {
@@ -44,11 +45,9 @@ type SerializableLSTM struct {
 }
 
 type SerializableLayer struct {
-	// For Dense layers
-	Neurons []SerializableNeuron `json:"neurons,omitempty"`
-	// For Embedding layers (2D matrix of weights)
-	Embeddings [][]float64        `json:"embeddings,omitempty"`
-	LSTMs      []SerializableLSTM `json:"lstms,omitempty"`
+	Neurons    []SerializableNeuron `json:"neurons,omitempty"`
+	Embeddings [][]float64          `json:"embeddings,omitempty"`
+	LSTMs      []SerializableLSTM   `json:"lstms,omitempty"`
 }
 
 type SerializableNetwork struct {
@@ -84,11 +83,10 @@ func NewNetwork(defs ...LayerDef) *Network {
 		loopStart = 1 // Start loop from defs[1]
 
 	} else if !def0.HasInputSpec {
-		// Original Dense check
 		panic("First Dense must be called with two args: Dense(m, inputDim)")
 
 	} else {
-		// Original Dense Input Setup: m=def0.Neurons, n=def0.InputNeurons
+		// Only Dense Input Setup: m=def0.Neurons, n=def0.InputNeurons
 		iLayer = NewInputLayer(def0.Neurons, def0.InputNeurons)
 		prevErrs = iLayer.ErrsFromNext
 		prevIns = iLayer.InsToNext
@@ -238,7 +236,7 @@ func (nw *Network) LogAndSaveWeights(epoch int, totalLoss float64, correct int, 
 
 		log.Printf("Epoch %d | Loss: %.6f | Accuracy: %.2f%% | Time: %.2f min\n", epoch, avgLoss, acc, elapsed)
 
-		if acc > 100.0 {
+		if acc > cfg.MinAccToSave {
 			filename := fmt.Sprintf("assets/weights_epoch_%d_acc_%.2f.json", epoch, acc)
 			if err := nw.SaveWeights(filename); err != nil {
 				log.Println("Error saving weights:", err)
@@ -339,7 +337,6 @@ func (nw *Network) Train(X [][]float64, Y any, cfg TrainingConfig) {
 }
 
 // --- Internal Training Functions ---
-
 // trainNonSequential handles standard, non-RNN training (Y is []float64).
 func (nw *Network) trainNonSequential(X [][]float64, Y []float64, cfg TrainingConfig, limit, dataSize int, start time.Time) {
 	for epoch := range cfg.Epochs {
@@ -382,6 +379,9 @@ func (nw *Network) trainSequential(X [][]float64, Y [][]float64, cfg TrainingCon
 	if dataSize == 0 || len(X[0]) == 0 {
 		log.Println("Sequential training requires non-empty data with timesteps.")
 		return
+	}
+	if cfg.BatchSize != 1 {
+		panic("Sequential training currently supports only BatchSize=1.")
 	}
 	timesteps := len(X[0])
 
@@ -501,6 +501,41 @@ func (nw *Network) PredictProbs(x []float64, cfg TrainingConfig) []float64 {
 	return []float64{}
 }
 
+func (nw *Network) PredictSeq(x []float64, cfg TrainingConfig) float64 {
+	nw.ResetLSTMState()
+
+	for t := range x {
+		nw.FeedForward([]float64{x[t]})
+	}
+	predVector := nw.GetOutput()
+	switch cfg.LossFunction {
+	case CATEGORICAL_CROSS_ENTROPY:
+		predVector = Softmax(predVector, 1.0)
+		predictedClass := OneHotDecode(predVector)
+
+		return predictedClass
+
+	case BINARY_CROSS_ENTROPY:
+		predScalar := sigmoid(predVector[0]) // Probability output
+
+		// Determine the binary class based on the 0.5 threshold
+		predictedClass := 0
+		if predScalar >= 0.5 {
+			predictedClass = 1
+		}
+
+		return float64(predictedClass)
+	case MSE:
+		predScalar := predVector[0]
+		return predScalar
+
+	default:
+		// Handle uninitialized or unknown loss function
+		log.Printf("Warning: Cannot log test result. Unknown loss function: %d\n", cfg.LossFunction)
+	}
+	return 0.0
+}
+
 func (nw *Network) Evaluate(X [][]float64, Y []float64, cfg TrainingConfig) (float64, float64) {
 	totalLoss := 0.0
 	correct := 0
@@ -523,6 +558,37 @@ func (nw *Network) Evaluate(X [][]float64, Y []float64, cfg TrainingConfig) (flo
 			correct++
 		}
 	}
+	avgLoss := totalLoss / float64(dataSize)
+	acc := float64(correct) / float64(dataSize) * 100.0
+	return avgLoss, acc
+}
+
+func (nw *Network) EvaluateSeq(X [][]float64, Y []float64, cfg TrainingConfig) (float64, float64) {
+	totalLoss := 0.0
+	correct := 0
+	dataSize := len(X)
+
+	for i := range X {
+		nw.ResetLSTMState()
+
+		seq := X[i] // full sequence
+		target := Y[i]
+
+		// run through timesteps
+		for t := range seq {
+			nw.FeedForward([]float64{seq[t]})
+		}
+
+		pred := nw.GetOutput()
+
+		loss, _, _ := nw.computeLoss(pred, target, cfg)
+		totalLoss += loss
+
+		if nw.isCorrect(pred, target, cfg) {
+			correct++
+		}
+	}
+
 	avgLoss := totalLoss / float64(dataSize)
 	acc := float64(correct) / float64(dataSize) * 100.0
 	return avgLoss, acc
