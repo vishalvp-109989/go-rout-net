@@ -9,9 +9,10 @@ import (
 )
 
 var endTokens = map[string]bool{
-	".":   true,
+	".":   false,
 	"?":   false,
 	"!":   false,
+	"eos": true,
 }
 
 // -------------------------------------------------------------

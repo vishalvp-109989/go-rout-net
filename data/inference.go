@@ -33,9 +33,9 @@ const (
 )
 
 var endTokensInf = map[string]bool{
-	".":   true,
-	"?":   true,
-	"!":   true,
+	".":   false,
+	"?":   false,
+	"!":   false,
 	"eos": false,
 }
 
