@@ -59,6 +59,7 @@ func main() {
 	log.Printf("Loaded dataset: %d samples, %d input features\n", numSamples, inputDim)
 
 	nw := NewNetwork(
+		Input(contextLen, Sequential(sequential)),
 		Embedding(embedDim, VocabSize(vocabSize), OutputDim(outputDim)),
 		LSTM(64, Timesteps(contextLen), Initializer("xavier")),
 		Dense(64, Activation("relu")),

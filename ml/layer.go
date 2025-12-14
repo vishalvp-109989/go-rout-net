@@ -2,16 +2,41 @@ package ml
 
 import (
 	"fmt"
+	"log"
+	"math"
 )
 
 const (
-	LayerTypeDense LayerType = iota
+	LayerTypeInput LayerType = iota // New type for the first definition
+	LayerTypeDense
 	LayerTypeEmbedding
 	LayerTypeLSTM
+	LayerTypeConv1D
+	LayerTypeConv2D
 )
 
-type LayerOption func(*LayerDef)
+// Helper for logging layer types
+func LayerTypeString(t LayerType) string {
+	switch t {
+	case LayerTypeInput:
+		return "Input"
+	case LayerTypeDense:
+		return "Dense"
+	case LayerTypeConv1D:
+		return "Conv1D"
+	case LayerTypeConv2D:
+		return "Conv2D"
+	case LayerTypeLSTM:
+		return "LSTM"
+	case LayerTypeEmbedding:
+		return "Embedding"
+	default:
+		return "Unknown"
+	}
+}
+
 type LayerType int
+type LayerOption func(*LayerDef)
 
 type Layer struct {
 	Neurons         []*Neuron
@@ -19,16 +44,20 @@ type Layer struct {
 	EmbeddingNeuron *EmbeddingNeuron // Only one Embedding Block per Layer
 	ErrsFromNext    [][]chan float64
 	InsToNext       [][]chan float64
+	LayerDef        LayerDef
 }
 
 type LayerDef struct {
 	Type         LayerType // Add this field
-	InputNeurons int
 	Neurons      int
 	Activation   ActivationFunc
 	Gradient     ActivationFunc
 	HasInputSpec bool
 	Initializer  InitializerFunc
+
+	// Conv1D Specific Fields
+	KernelSize int // K, e.g., 9
+	Stride     int // S, e.g., 1
 
 	// Embedding Specific Fields
 	EmbedDim  int
@@ -37,6 +66,30 @@ type LayerDef struct {
 
 	// LSTM Specific Fields
 	Timesteps int // For LSTM layers
+}
+
+func Input(inputDim int, options ...LayerOption) LayerDef {
+	d := LayerDef{
+		Type:         LayerTypeInput,
+		Neurons:      inputDim,
+		HasInputSpec: true,
+	}
+
+	for _, opt := range options {
+		opt(&d)
+	}
+	return d
+}
+
+func Sequential(isSeq bool) LayerOption {
+	return func(d *LayerDef) {
+		if isSeq {
+			if d.Type != LayerTypeInput {
+				panic("Sequential option can only be applied to Input layer.")
+			}
+			d.Neurons = 1 // For sequential input, set neurons to 1
+		}
+	}
 }
 
 func Embedding(embedDim int, options ...LayerOption) LayerDef {
@@ -59,8 +112,6 @@ func Embedding(embedDim int, options ...LayerOption) LayerDef {
 		}
 		// InputLen is the number of words in the sequence
 		d.InputLen = d.Neurons / d.EmbedDim
-		// InputNeurons is the dimension of the input layer (sequence length)
-		d.InputNeurons = d.InputLen
 	} else {
 		panic("Embedding layer requires EmbedDim, VocabSize, and OutputDim options.")
 	}
@@ -78,6 +129,64 @@ func OutputDim(dim int) LayerOption {
 	return func(d *LayerDef) {
 		d.Neurons = dim // Output size for the layer definition
 	}
+}
+
+func Conv1D(options ...LayerOption) LayerDef {
+	d := LayerDef{
+		Neurons:     1, // F: number of filters (unsupported option for now)
+		KernelSize:  1, // Default kernel size
+		Stride:      1, // Default stride
+		Initializer: Random,
+		Activation:  linear,
+		Gradient:    dfLinear,
+		Type:        LayerTypeConv1D,
+	}
+	for _, opt := range options {
+		opt(&d)
+	}
+
+	if d.KernelSize <= 0 || d.Stride <= 0 {
+		panic("Conv1D requires KernelSize and Stride to be positive.")
+	}
+
+	return d
+}
+
+func Conv2D(options ...LayerOption) LayerDef {
+	d := LayerDef{
+		Neurons:     1, // This will be recalculated in NewInputLayer based on input size
+		KernelSize:  9, // Default to 3x3
+		Stride:      1,
+		Initializer: Random,
+		Activation:  linear,
+		Gradient:    dfLinear,
+		Type:        LayerTypeConv2D,
+	}
+	for _, opt := range options {
+		opt(&d)
+	}
+
+	// Validation 1: Basic Positive Checks
+	if d.KernelSize <= 0 || d.Stride <= 0 {
+		panic("Conv2D requires KernelSize and Stride to be positive.")
+	}
+
+	// Validation 2: Perfect Square Check for Kernel
+	// We need to know the side length (e.g., sqrt(9) = 3) to do the stride math later.
+	kSide := int(math.Sqrt(float64(d.KernelSize)))
+	if kSide*kSide != d.KernelSize {
+		panic(fmt.Sprintf("Conv2D Error: KernelSize %d is not a perfect square (e.g., 9 for 3x3, 25 for 5x5).", d.KernelSize))
+	}
+
+	return d
+}
+
+func Kernel(k int) LayerOption {
+	return func(d *LayerDef) { d.KernelSize = k }
+}
+
+func Stride(s int) LayerOption {
+	return func(d *LayerDef) { d.Stride = s }
 }
 
 func LSTM(neurons int, options ...LayerOption) LayerDef {
@@ -149,15 +258,8 @@ func Initializer(name string) LayerOption {
 	}
 }
 
-func InputDim(dim int) LayerOption {
-	return func(d *LayerDef) {
-		d.InputNeurons = dim
-		d.HasInputSpec = true
-	}
-}
-
 // NewEmbedLayer creates a Layer struct that holds the single Embedding block.
-func NewEmbedLayer(errsToPrev, outsFromPrev [][]chan float64, def0, def1 LayerDef) *Layer {
+func NewEmbedLayer(errsToPrev, outsFromPrev [][]chan float64, def0, def1 *LayerDef) *Layer {
 	// For Embedding, the errsToPrev and outsFromPrev should only have 1 row (m=1)
 	if len(outsFromPrev) != 1 || len(errsToPrev) != 1 {
 		panic("Embedding layer expects input from a single InputLayer row (m=1)")
@@ -200,43 +302,97 @@ func NewEmbedLayer(errsToPrev, outsFromPrev [][]chan float64, def0, def1 LayerDe
 	layer.EmbeddingNeuron = embeddingBlock
 	layer.ErrsFromNext = errsFromNext
 	layer.InsToNext = insToNext
+	log.Printf("Embedding Layer initialized with size %dx%d channels, sized for next layer: %s.\n", 1, outputNeurons, "Flatten")
 
+	// Embedding Neuron does the flatten internally. There is no Layer called "Flatten". Just adding a print here for clarity.
+	log.Printf("Flatten Layer initialized with size %dx%d channels, sized for next layer: %s.\n", outputNeurons, def1.Neurons, LayerTypeString(def1.Type))
 	return layer
 }
 
-func NewInputLayer(m, n int) *Layer {
-	inToNext := make([][]chan float64, m)
-	for i := range m {
-		inToNext[i] = make([]chan float64, n)
-		for j := range n {
-			inToNext[i][j] = make(chan float64, ChannelCapacity) // buffered
+func NewInputLayer(defCurr, defNext *LayerDef) *Layer {
+
+	n := defCurr.Neurons
+	m := defNext.Neurons
+
+	switch defNext.Type {
+	case LayerTypeEmbedding:
+		m = 1
+
+	case LayerTypeConv1D:
+		inputLen := defCurr.Neurons
+		k := defNext.KernelSize
+		s := defNext.Stride
+
+		if (inputLen-k)%s != 0 {
+			panic(fmt.Sprintf("Conv1D layer error: Input (%d) - Kernel (%d) is not divisible by Stride (%d).", inputLen, k, s))
 		}
+
+		m = (inputLen-k)/s + 1
+		defNext.Neurons = m
+		n = k
+
+	case LayerTypeConv2D:
+		inputFlat := defCurr.Neurons // e.g., 784
+		kFlat := defNext.KernelSize  // e.g., 9
+		s := defNext.Stride          // e.g., 1
+
+		inputSide := int(math.Sqrt(float64(inputFlat)))
+		if inputSide*inputSide != inputFlat {
+			panic(fmt.Sprintf("Conv2D Error: Input size %d is not a perfect square (cannot infer 2D grid).", inputFlat))
+		}
+
+		kSide := int(math.Sqrt(float64(kFlat)))
+
+		if (inputSide-kSide)%s != 0 {
+			panic(fmt.Sprintf("Conv2D Error: Input width (%d) - Kernel width (%d) is not divisible by Stride (%d).", inputSide, kSide, s))
+		}
+
+		outputSide := (inputSide-kSide)/s + 1 // e.g., (28-3)/1 + 1 = 26
+
+		m = outputSide * outputSide // e.g., 26 * 26 = 676
+		defNext.Neurons = m         // Update definition
+
+		n = kFlat // Each neuron looks at 9 inputs (3x3)
 	}
 
+	// Create Channel Matrix: [DestinationNeuron][InputIndex]
+	inToNext := make([][]chan float64, m)
 	errsFromNext := make([][]chan float64, m)
-	for i := range m {
+
+	for i := 0; i < m; i++ {
+		inToNext[i] = make([]chan float64, n)
 		errsFromNext[i] = make([]chan float64, n)
-		for j := range n {
-			// Initialize channels to receive the final error signal from the first hidden layer
+
+		for j := 0; j < n; j++ {
+			inToNext[i][j] = make(chan float64, ChannelCapacity)
 			errsFromNext[i][j] = make(chan float64, ChannelCapacity)
 		}
 	}
+
+	log.Printf("InputLayer initialized with size %dx%d channels, sized for next layer: %s.\n", n, m, LayerTypeString(defNext.Type))
+
 	return &Layer{
 		InsToNext:    inToNext,
 		ErrsFromNext: errsFromNext,
+		LayerDef:     *defNext,
 	}
 }
 
-func NewHiddenLayer(errsToPrev, outsFromPrev [][]chan float64, defCurr, defNext LayerDef) *Layer {
+func NewHiddenLayer(errsToPrev, outsFromPrev [][]chan float64, defCurr, defNext *LayerDef) *Layer {
 	// 1. Common Validation
-	if len(outsFromPrev) != defCurr.Neurons || len(errsToPrev) != defCurr.Neurons {
-		panic("Mismatch between provided channels and current layer neuron count")
+	switch defCurr.Type {
+	case LayerTypeConv1D, LayerTypeConv2D:
+		// Convolutional layers skip the neuron count validation
+	case LayerTypeLSTM:
+		if defCurr.Timesteps != ChannelCapacity {
+			panic("LSTM layer's Timesteps must match ChannelCapacity")
+		}
+		fallthrough
+	default:
+		if len(outsFromPrev) != defCurr.Neurons || len(errsToPrev) != defCurr.Neurons {
+			panic("Mismatch between provided channels and current layer neuron count")
+		}
 	}
-
-	if defCurr.Type == LayerTypeLSTM && defCurr.Timesteps != ChannelCapacity {
-		panic("LSTM layer's Timesteps must match ChannelCapacity")
-	}
-
 	numNeurons := defCurr.Neurons
 	outputNeurons := defNext.Neurons
 
@@ -287,7 +443,7 @@ func NewHiddenLayer(errsToPrev, outsFromPrev [][]chan float64, defCurr, defNext 
 	// 5. Common Transpose
 	layer.ErrsFromNext = Transpose(layer.ErrsFromNext)
 	layer.InsToNext = Transpose(layer.InsToNext)
-
+	log.Printf("HiddenLayer (%s) initialized with size %dx%d channels, sized for next layer: %s.\n", LayerTypeString(defCurr.Type), numNeurons, outputNeurons, LayerTypeString(defNext.Type))
 	return layer
 }
 

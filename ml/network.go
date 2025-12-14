@@ -57,48 +57,43 @@ type SerializableNetwork struct {
 // NewNetwork builds: InputLayer -> Layer(defs[1]) -> Layer(defs[2]) -> ... -> Layer(defs[len-1]) -> OutputLayer
 func NewNetwork(defs ...LayerDef) *Network {
 	if len(defs) < 2 {
-		panic("Provide at least an input spec (Embedding/Dense) and one Dense layer.")
+		panic("Provide at least an Input layer and one Output layer.")
+	}
+
+	if defs[0].Type != LayerTypeInput {
+		panic("First layer must be of type Input.")
 	}
 
 	var iLayer *Layer
 	var prevErrs, prevIns [][]chan float64
 	var hidden []*Layer
-	loopStart := 0
 
 	// 1. Handle the first layer (which defines the InputLayer structure)
-	def0 := defs[0]
+	iLayer = NewInputLayer(&defs[0], &defs[1])
+	prevErrs = iLayer.ErrsFromNext
+	prevIns = iLayer.InsToNext
+	iLayer.LayerDef = defs[0]
 
-	if def0.Type == LayerTypeEmbedding {
-		// If Embedding: InputLayer must be 1 row x InputLen columns (e.g., 1x5)
-		// InputLayer will send the 5 word indices (x1..x5)
-		iLayer = NewInputLayer(1, def0.InputNeurons)
+	// 2. Create subsequent layers
+	for i := 1; i < len(defs)-1; i++ {
+		var l *Layer
 
-		// Create the Embedding layer
-		l := NewEmbedLayer(iLayer.ErrsFromNext, iLayer.InsToNext, def0, defs[1])
+		switch defs[i].Type {
+		case LayerTypeEmbedding:
+			if i != 1 {
+				panic("Embedding layer can only be the first layer after Input.")
+			}
+			l = NewEmbedLayer(iLayer.ErrsFromNext, iLayer.InsToNext, &defs[i], &defs[i+1])
+		case LayerTypeConv1D, LayerTypeConv2D:
+			if i != 1 {
+				panic("Convolutional layer can only be the first layer after Input.") // TODO: Support deeper conv layers
+			}
+			fallthrough
+		default:
+			l = NewHiddenLayer(prevErrs, prevIns, &defs[i], &defs[i+1])
+		}
 		hidden = append(hidden, l)
-
-		// Advance for the next layer (Dense)
-		prevErrs = l.ErrsFromNext
-		prevIns = l.InsToNext
-		loopStart = 1 // Start loop from defs[1]
-
-	} else if !def0.HasInputSpec {
-		panic("First Dense must be called with two args: Dense(m, inputDim)")
-
-	} else {
-		// Only Dense Input Setup: m=def0.Neurons, n=def0.InputNeurons
-		iLayer = NewInputLayer(def0.Neurons, def0.InputNeurons)
-		prevErrs = iLayer.ErrsFromNext
-		prevIns = iLayer.InsToNext
-		loopStart = 0 // Start loop from defs[0]
-	}
-
-	// 2. Create subsequent Dense layers
-	// Start from the next definition (defs[loopStart]) up to the second-to-last layer.
-	for i := loopStart; i < len(defs)-1; i++ {
-		l := NewHiddenLayer(prevErrs, prevIns, defs[i], defs[i+1])
-		hidden = append(hidden, l)
-
+		l.LayerDef = defs[i]
 		// advance the prevs to this layer's outputs for the next iteration
 		prevErrs = l.ErrsFromNext
 		prevIns = l.InsToNext
@@ -107,6 +102,7 @@ func NewNetwork(defs ...LayerDef) *Network {
 	// 3. Last layer (using the last definition in the slice)
 	l := NewOutputLayer(prevErrs, prevIns, defs[len(defs)-1])
 	hidden = append(hidden, l)
+	l.LayerDef = defs[len(defs)-1]
 
 	return &Network{
 		InputLayer:  iLayer,
@@ -258,17 +254,80 @@ func (nw *Network) GetOutput() []float64 {
 }
 
 func (nw *Network) FeedForward(x []float64) {
-	iLayer := nw.InputLayer
-	m := len(iLayer.InsToNext)
-
-	if m == 0 || len(iLayer.InsToNext[0]) == 0 {
-		return
+	inputLayer := nw.InputLayer
+	
+	if len(nw.Hidden) == 0 {
+		panic("Network has no hidden layers.")
 	}
-	n := len(iLayer.InsToNext[0])
+	defNext := nw.Hidden[0].LayerDef
 
-	for k := range m {
-		for j := range n {
-			iLayer.InsToNext[k][j] <- x[j]
+	nextType := defNext.Type
+
+	switch nextType {
+	case LayerTypeConv1D:
+		k := defNext.KernelSize
+		s := defNext.Stride
+		m := defNext.Neurons // Number of windows
+
+		for windowIdx := range m {
+			// Calculate where this window starts in the raw input 'x'
+			startIdx := windowIdx * s
+
+			for kernelIdx := range k {
+				// Map input x[start + k] to channel [filter][k]
+				val := x[startIdx+kernelIdx]
+				inputLayer.InsToNext[windowIdx][kernelIdx] <- val
+			}
+		}
+
+	case LayerTypeConv2D:
+		k := defNext.KernelSize
+		s := defNext.Stride
+		m := defNext.Neurons // Number of windows
+
+		// 1. Derive 2D Dimensions needed for index mapping
+		inputLen := len(x)
+		inputWidth := int(math.Sqrt(float64(inputLen))) // e.g., 28
+		outputWidth := int(math.Sqrt(float64(m)))       // e.g., 26
+		kDim := int(math.Sqrt(float64(k)))              // e.g., 3
+
+		// 2. Loop through every Window (0 to m-1)
+		for windowIdx := range m {
+
+			// Calculate the 2D position of this specific window
+			// (Integer division gives Row, Modulo gives Column)
+			outRow := windowIdx / outputWidth
+			outCol := windowIdx % outputWidth
+
+			// 3. Loop through every Kernel Weight (0 to k-1)
+			for kernelIdx := range k {
+
+				// Calculate 2D position within the kernel (e.g., 0,0 to 2,2)
+				kRow := kernelIdx / kDim
+				kCol := kernelIdx % kDim
+
+				// 4. Map to Input 2D coordinates
+				// InputRow = (WindowRow * Stride) + KernelRow
+				inRow := (outRow * s) + kRow
+				inCol := (outCol * s) + kCol
+
+				// 5. Flatten back to 1D index to access array 'x'
+				flattenedIdx := (inRow * inputWidth) + inCol
+
+				val := x[flattenedIdx]
+				inputLayer.InsToNext[windowIdx][kernelIdx] <- val
+			}
+		}
+
+	default:
+		m := len(inputLayer.InsToNext)
+		n := len(x)
+
+		for neuronIdx := range m {
+			for inputIdx := range n {
+				// Copy input x[i] to every neuron's dedicated channel
+				inputLayer.InsToNext[neuronIdx][inputIdx] <- x[inputIdx]
+			}
 		}
 	}
 }
