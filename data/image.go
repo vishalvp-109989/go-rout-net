@@ -5,9 +5,9 @@ import (
 	"os"
 )
 
-// convertJpg1D reads an image file, converts to grayscale if needed,
+// ConvertJpg1D reads an image file, converts to grayscale if needed,
 // flattens it row-major, and returns []float64
-func convertJpg1D(path string) ([]float64, error) {
+func ConvertJpg1D(path string) ([]float64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
