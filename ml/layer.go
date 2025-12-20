@@ -54,6 +54,7 @@ type LayerDef struct {
 	Gradient     ActivationFunc
 	HasInputSpec bool
 	Initializer  InitializerFunc
+	Batch        int
 
 	// Conv1D Specific Fields
 	KernelSize int // K, e.g., 9
@@ -73,6 +74,7 @@ func Input(inputDim int, options ...LayerOption) LayerDef {
 		Type:         LayerTypeInput,
 		Neurons:      inputDim,
 		HasInputSpec: true,
+		Batch:        1,
 	}
 
 	for _, opt := range options {
@@ -89,6 +91,12 @@ func Sequential(isSeq bool) LayerOption {
 			}
 			d.Neurons = 1 // For sequential input, set neurons to 1
 		}
+	}
+}
+
+func Batch(batch int) LayerOption {
+	return func(d *LayerDef) {
+		d.Batch = batch
 	}
 }
 
@@ -260,22 +268,20 @@ func Initializer(name string) LayerOption {
 
 // NewEmbedLayer creates a Layer struct that holds the single Embedding block.
 func NewEmbedLayer(errsToPrev, outsFromPrev []chan Synapse, defCurr, defNext *LayerDef) *Layer {
-	// 1. Common Validation
 	numNeurons := defCurr.Neurons
 	outputNeurons := defNext.Neurons
 
-	// 2. Common Struct Initialization
 	layer := &Layer{
 		ErrsFromNext: make([]chan Synapse, numNeurons),
 		InsToNext:    make([]chan Synapse, outputNeurons),
 	}
 
 	for i := range outputNeurons {
-		layer.InsToNext[i] = make(chan Synapse, ChannelCapacity)
+		layer.InsToNext[i] = make(chan Synapse, numNeurons*ChannelCapacity)
 	}
 
 	for j := range numNeurons {
-		layer.ErrsFromNext[j] = make(chan Synapse, ChannelCapacity)
+		layer.ErrsFromNext[j] = make(chan Synapse, outputNeurons*ChannelCapacity)
 	}
 
 	fanIn := func(ins []chan Synapse) chan Synapse {
@@ -312,7 +318,6 @@ func NewEmbedLayer(errsToPrev, outsFromPrev []chan Synapse, defCurr, defNext *La
 }
 
 func NewInputLayer(defCurr, defNext *LayerDef) *Layer {
-
 	m := defNext.Neurons
 	n := defCurr.Neurons
 
@@ -359,11 +364,11 @@ func NewInputLayer(defCurr, defNext *LayerDef) *Layer {
 
 	inToNext := make([]chan Synapse, m)
 	for i := 0; i < m; i++ {
-		inToNext[i] = make(chan Synapse, ChannelCapacity)
+		inToNext[i] = make(chan Synapse, n*ChannelCapacity)
 	}
 	errsFromNext := make([]chan Synapse, n)
 	for i := 0; i < n; i++ {
-		errsFromNext[i] = make(chan Synapse, ChannelCapacity)
+		errsFromNext[i] = make(chan Synapse, m*ChannelCapacity)
 	}
 
 	log.Printf("InputLayer initialized with size %dx%d channels, sized for next layer: %s.\n", n, m, LayerTypeString(defNext.Type))
@@ -376,42 +381,29 @@ func NewInputLayer(defCurr, defNext *LayerDef) *Layer {
 }
 
 func NewHiddenLayer(errsToPrev, outsFromPrev []chan Synapse, defCurr, defNext *LayerDef) *Layer {
-	// 1. Common Validation
-	switch defCurr.Type {
-	case LayerTypeConv1D, LayerTypeConv2D:
-		// Convolutional layers skip the neuron count validation
-	case LayerTypeLSTM:
-		if defCurr.Timesteps != ChannelCapacity {
-			panic("LSTM layer's Timesteps must match ChannelCapacity")
-		}
-	}
 	numNeurons := defCurr.Neurons
 	outputNeurons := defNext.Neurons
 
-	// 2. Common Struct Initialization
 	layer := &Layer{
 		ErrsFromNext: make([]chan Synapse, numNeurons),
 		InsToNext:    make([]chan Synapse, outputNeurons),
 	}
 
 	for i := range outputNeurons {
-		layer.InsToNext[i] = make(chan Synapse, ChannelCapacity)
+		layer.InsToNext[i] = make(chan Synapse, numNeurons*ChannelCapacity)
 	}
 
 	for j := range numNeurons {
-		layer.ErrsFromNext[j] = make(chan Synapse, ChannelCapacity)
+		layer.ErrsFromNext[j] = make(chan Synapse, outputNeurons*ChannelCapacity)
 	}
 
-	// 3. Pre-allocate specific neuron slices based on type
 	if defCurr.Type == LayerTypeLSTM {
 		layer.LSTMNeurons = make([]*LSTMNeuron, numNeurons)
 	} else {
 		layer.Neurons = make([]*Neuron, numNeurons)
 	}
 
-	// 4. Single Loop for Creation
 	for j := range numNeurons {
-		// B. Instantiate Specific Neuron
 		if defCurr.Type == LayerTypeLSTM {
 			layer.LSTMNeurons[j] = NewLSTMNeuron(j,
 				errsToPrev, outsFromPrev[j],
@@ -445,11 +437,11 @@ func NewOutputLayer(errsToPrev, outsFromPrev []chan Synapse, def LayerDef) *Laye
 	}
 
 	for i := range outputNeurons {
-		layer.InsToNext[i] = make(chan Synapse, ChannelCapacity)
+		layer.InsToNext[i] = make(chan Synapse, numNeurons*ChannelCapacity)
 	}
 
 	for j := range numNeurons {
-		layer.ErrsFromNext[j] = make(chan Synapse, ChannelCapacity)
+		layer.ErrsFromNext[j] = make(chan Synapse, outputNeurons*ChannelCapacity)
 	}
 
 	// 1. Initialize each Neuron in the layer

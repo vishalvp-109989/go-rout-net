@@ -65,6 +65,8 @@ func NewNetwork(defs ...LayerDef) *Network {
 		panic("First layer must be of type Input.")
 	}
 
+	ChannelCapacity = defs[0].Batch // Set global channel capacity based on input layer batch size : Hacky but works for now
+
 	var iLayer *Layer
 	var prevErrs, prevIns []chan Synapse
 	var hidden []*Layer
@@ -327,7 +329,7 @@ func (nw *Network) FeedForward(x []float64) {
 		wg := sync.WaitGroup{}
 		for neuronIdx := range m {
 			wg.Add(1)
-			go func(ch chan Synapse){
+			go func(ch chan Synapse) {
 				defer wg.Done()
 				for inputIdx := range n {
 					ch <- Synapse{ID: inputIdx, Value: x[inputIdx]}
@@ -358,7 +360,7 @@ func (nw *Network) WaitForBackpropFinish() {
 	// Wait for the backpropagation signal on ALL m*n channels
 	for k := range m {
 		wg.Add(1)
-		go func(ch chan Synapse){
+		go func(ch chan Synapse) {
 			defer wg.Done()
 			for range n {
 				<-ch
@@ -366,6 +368,28 @@ func (nw *Network) WaitForBackpropFinish() {
 		}(iLayer.ErrsFromNext[k])
 	}
 	wg.Wait()
+}
+
+func (nw *Network) DrainBatch(batchSize int, done chan struct{}) {
+	iLayer := nw.InputLayer
+	m := len(iLayer.ErrsFromNext)
+	n := len(iLayer.InsToNext)
+
+	wg := sync.WaitGroup{}
+
+	// Launch a drainer for each input channel
+	for k := range m {
+		wg.Add(1)
+		go func(ch chan Synapse) {
+			defer wg.Done()
+			for range batchSize * n {
+				<-ch
+			}
+		}(iLayer.ErrsFromNext[k])
+	}
+
+	wg.Wait()
+	done <- struct{}{} // Signal main thread that draining is complete
 }
 
 func (nw *Network) ResetLSTMState() {
@@ -381,6 +405,10 @@ func (nw *Network) Train(X [][]float64, Y any, cfg TrainingConfig) {
 	log.Printf("Train: %+v", cfg)
 	nw.UpdateNeuronCfg(cfg)
 
+	if ChannelCapacity != cfg.BatchSize {
+		panic("ChannelCapacity must equal BatchSize for correct operation.")
+	}
+
 	start := time.Now()
 	dataSize := len(X)
 
@@ -393,9 +421,9 @@ func (nw *Network) Train(X [][]float64, Y any, cfg TrainingConfig) {
 	// --- Core Logic Dispatcher (Type check only happens ONCE) ---
 	switch targets := Y.(type) {
 	case []float64:
-		nw.trainNonSequential(X, targets, cfg, limit, dataSize, start)
+		nw.trainNonSequential(X, targets, cfg, limit, start)
 	case [][]float64:
-		nw.trainSequential(X, targets, cfg, limit, dataSize, start)
+		nw.trainSequential(X, targets, cfg, limit, start)
 	default:
 		log.Fatalf("Unsupported target data type for Y: %T. Must be []float64 (non-sequential) or [][]float64 (sequential).", Y)
 	}
@@ -403,58 +431,8 @@ func (nw *Network) Train(X [][]float64, Y any, cfg TrainingConfig) {
 
 // --- Internal Training Functions ---
 // trainNonSequential handles standard, non-RNN training (Y is []float64).
-func (nw *Network) trainNonSequential(X [][]float64, Y []float64, cfg TrainingConfig, limit, dataSize int, start time.Time) {
-	for epoch := range cfg.Epochs {
-        totalLoss := 0.0
-        correct := 0
-
-        if cfg.ShuffleData {
-            Shuffle(X, Y)
-        }
-
-		for i := range limit {
-            x := X[i]
-            target := Y[i]
-
-            // 1. Forward pass
-            nw.FeedForward(x)
-            pred := nw.GetOutput()
-
-            // 2. Compute loss
-            loss, predVector, targetVector := nw.computeLoss(pred, target, cfg)
-            totalLoss += loss
-
-            // 3. Backward pass
-            nw.Feedback(predVector, targetVector)
-            nw.WaitForBackpropFinish() 
-
-			// 4. Accuracy Check
-            if nw.isCorrect(pred, target, cfg) {
-                correct++
-            }
-        }
-
-		// Logging and Saving Weights
-        nw.LogAndSaveWeights(epoch, totalLoss, correct, limit, start, cfg)
-    }
-}
-
-// trainSequential handles sequence (RNN/LSTM) training (Y is [][]float64).
-func (nw *Network) trainSequential(X [][]float64, Y [][]float64, cfg TrainingConfig, limit, dataSize int, start time.Time) {
-	if dataSize == 0 || len(X[0]) == 0 {
-		log.Println("Sequential training requires non-empty data with timesteps.")
-		return
-	}
-	if cfg.BatchSize != 1 {
-		panic("Sequential training currently supports only BatchSize=1.")
-	}
-	timesteps := len(X[0])
-
-	// These slices store data across the sequence for backprop-through-time
-	predVecs := make([][]float64, timesteps)
-	targetVecs := make([][]float64, timesteps)
-
-	for epoch := range cfg.Epochs {
+func (nw *Network) trainNonSequential(X [][]float64, Y []float64, cfg TrainingConfig, limit int, start time.Time) {
+	for epoch := 0; epoch < cfg.Epochs; epoch++ {
 		totalLoss := 0.0
 		correct := 0
 
@@ -462,49 +440,122 @@ func (nw *Network) trainSequential(X [][]float64, Y [][]float64, cfg TrainingCon
 			Shuffle(X, Y)
 		}
 
-		for i := range limit {
-			nw.ResetLSTMState()
+		// Loop by Batch
+		for i := 0; i < limit; i += cfg.BatchSize {
+			// 1. Calculate actual batch size (handle last partial batch)
+			currentBatchSize := cfg.BatchSize
+			if i+currentBatchSize > limit {
+				currentBatchSize = limit - i
+			}
 
-			Xseq := X[i]
-			Yseq := Y[i]
+			// 2. START BACKGROUND DRAINER
+			drainDone := make(chan struct{})
+			go nw.DrainBatch(currentBatchSize, drainDone)
 
-			var lastPred []float64
-			var lastTarget float64
+			// 3. FEED THE BATCH
+			batchEnd := i + currentBatchSize
+			for j := i; j < batchEnd; j++ {
+				x := X[j]
+				target := Y[j]
 
-			// Forward Pass (through time)
-			for t := range timesteps {
-				// We assume Xseq is a flattened sequence, so we take a single element for input
-				x_t := []float64{Xseq[t]}
-				target_t := Yseq[t]
+				nw.FeedForward(x)
+				pred := nw.GetOutput()
 
-				// 1. Forward pass for timestep t
-				nw.FeedForward(x_t)
-				pred_t := nw.GetOutput()
-
-				// 2. Compute loss for timestep t
-				loss, predVector, targetVector := nw.computeLoss(pred_t, target_t, cfg)
+				loss, predVector, targetVector := nw.computeLoss(pred, target, cfg)
 				totalLoss += loss
 
-				predVecs[t] = predVector
-				targetVecs[t] = targetVector
+				nw.Feedback(predVector, targetVector) // Inject error
 
-				// Keep track of the last step for accuracy check
-				lastPred = pred_t
-				lastTarget = target_t
+				if nw.isCorrect(pred, target, cfg) {
+					correct++
+				}
 			}
 
-			// 3. Backward Pass (through time)
-			for t := range timesteps {
-				nw.Feedback(predVecs[t], targetVecs[t])
-			}
-			// Wait for all backpropagation to finish
-			for range timesteps {
-				nw.WaitForBackpropFinish()
+			// 4. WAIT FOR DRAINER TO FINISH
+			<-drainDone
+		}
+
+		nw.LogAndSaveWeights(epoch, totalLoss, correct, limit, start, cfg)
+	}
+}
+
+// trainSequential handles sequence (RNN/LSTM) training (Y is [][]float64).
+func (nw *Network) trainSequential(X [][]float64, Y [][]float64, cfg TrainingConfig, limit int, start time.Time) {
+	if len(X[0]) == 0 {
+		log.Println("Sequential training requires non-empty data with timesteps.")
+		return
+	}
+
+	timesteps := len(X[0])
+
+	// Pre-allocate buffers for BPTT to avoid memory thrashing
+	predVecs := make([][]float64, timesteps)
+	targetVecs := make([][]float64, timesteps)
+
+	for epoch := 0; epoch < cfg.Epochs; epoch++ {
+		totalLoss := 0.0
+		correct := 0
+
+		if cfg.ShuffleData {
+			Shuffle(X, Y)
+		}
+
+		// 1. OUTER LOOP: Iterate by Batch Size
+		for i := 0; i < limit; i += cfg.BatchSize {
+
+			// Calculate actual batch bounds (handle final partial batch)
+			batchEnd := i + cfg.BatchSize
+			if batchEnd > limit {
+				batchEnd = limit
 			}
 
-			// 4. Accuracy Check (only on the final output of the sequence)
-			if nw.isCorrect(lastPred, lastTarget, cfg) {
-				correct++
+			// 2. INNER LOOP: Process sequences within the batch
+			for j := i; j < batchEnd; j++ {
+				// A. Reset State (CRITICAL for every new sequence)
+				nw.ResetLSTMState()
+
+				Xseq := X[j]
+				Yseq := Y[j]
+
+				var lastPred []float64
+				var lastTarget float64
+
+				// --- B. Forward Pass (through time) ---
+				for t := range timesteps {
+					x_t := []float64{Xseq[t]}
+					target_t := Yseq[t]
+
+					nw.FeedForward(x_t)
+					pred_t := nw.GetOutput()
+
+					loss, predVector, targetVector := nw.computeLoss(pred_t, target_t, cfg)
+					totalLoss += loss
+
+					predVecs[t] = predVector
+					targetVecs[t] = targetVector
+
+					lastPred = pred_t
+					lastTarget = target_t
+				}
+
+				// --- C. Prepare Drainer ---
+				// Start listening BEFORE we send errors to prevent deadlock
+				drainDone := make(chan struct{})
+				go nw.DrainBatch(timesteps, drainDone)
+
+				// --- D. Backward Pass (through time) ---
+				for t := range timesteps {
+					nw.Feedback(predVecs[t], targetVecs[t])
+				}
+
+				// --- E. Synchronization ---
+				// Wait for the errors to flow all the way back to Input layer
+				<-drainDone
+
+				// Accuracy Check
+				if nw.isCorrect(lastPred, lastTarget, cfg) {
+					correct++
+				}
 			}
 		}
 
@@ -755,6 +806,7 @@ func (nw *Network) UpdateNeuronCfg(cfg TrainingConfig) {
 			// Send with Ack channel
 			neuron.ConfigUpdate <- NeuronCfg{
 				LR:        cfg.LearningRate,
+				BatchSize: cfg.BatchSize,
 				ClipValue: cfg.ClipValue,
 				Ack:       ack,
 			}

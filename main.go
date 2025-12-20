@@ -10,17 +10,19 @@ import (
 )
 
 func main() {
-	embedDim := 4
-	contextLen := 5
-	freqThreshold := 1 // Replace words with freq < threshold with <unk>
-	sequential := true // Whether to use sequential model (LSTM) or non-sequential (n-gram)
-
-	var outputDim, vocabSize int
 	var X [][]float64
 	var Y any
 	var err error
+	var vocabSize int
+
+	var outputDim int
 	var wordToID map[string]int
 	var idToWord []string
+
+	embedDim := 4
+	contextLen := 5
+	freqThreshold := 1  // Replace words with freq < threshold with <unk>
+	sequential := false // Whether to use sequential model (LSTM) or non-sequential (n-gram)
 
 	if sequential {
 		outputDim = embedDim
@@ -59,9 +61,9 @@ func main() {
 	log.Printf("Loaded dataset: %d samples, %d input features\n", numSamples, inputDim)
 
 	nw := NewNetwork(
-		Input(contextLen, Sequential(sequential)),
+		Input(inputDim, Sequential(false), Batch(32)),
 		Embedding(embedDim, VocabSize(vocabSize), OutputDim(outputDim)),
-		LSTM(64, Timesteps(contextLen), Initializer("xavier")),
+		// LSTM(64, Timesteps(contextLen), Initializer("xavier")),
 		Dense(64, Activation("relu")),
 		Dense(vocabSize),
 	)
@@ -87,14 +89,14 @@ func main() {
 	}()
 
 	cfg := TrainingConfig{
-		Epochs:       250,
-		BatchSize:    1,
-		LearningRate: 0.01,
+		Epochs:       200,
+		BatchSize:    32, // Use same batch size as defined earlier
+		LearningRate: 0.1,
 		ClipValue:    5.0,
 		LossFunction: CATEGORICAL_CROSS_ENTROPY,
 		KClasses:     vocabSize, // For CATEGORICAL_CROSS_ENTROPY (Softmax Output).
 		VerboseEvery: 10,
-		ShuffleData:  false,
+		ShuffleData:  true,
 		MinAccToSave: 101,
 	}
 

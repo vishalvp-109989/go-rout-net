@@ -1,7 +1,6 @@
 package ml
 
 import (
-	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -86,6 +85,12 @@ type LSTMNeuron struct {
 
 	LR        float64 // Learning Rate
 	ClipValue float64 // Gradient Clipping Value
+
+	// Batching State
+	BatchSize   int
+	BatchCount  int
+	BatchGradsW [][][]float64 // [BatchSize][4 Gates][InputSize+1]
+	BatchGradsB [][]float64   // [BatchSize][4 Gates]
 
 	// Communication Channels
 	ErrsToPrev   []chan Synapse // Write to previous layer
@@ -578,7 +583,7 @@ func NewLSTMNeuron(
 	tanh := func(x float64) float64 { return math.Tanh(x) }
 	dtanh := func(y float64) float64 { return 1.0 - (y * y) }
 
-	// --- NEW: Gradient Clipping Helper ---
+	// Gradient Clipping Helper
 	clip := func(v, limit float64) float64 {
 		if v > limit {
 			return limit
@@ -599,6 +604,14 @@ func NewLSTMNeuron(
 		timestep := 0
 		errCounter := 0
 
+		// Gradient Accumulators for Batch Averaging (reused memory)
+		// These act as the temporary sum holders during the batch update step
+		avgGradsW := make([][]float64, 4)
+		for i := range 4 {
+			avgGradsW[i] = make([]float64, numInputs+1)
+		}
+		avgGradsB := make([]float64, 4)
+
 		calculateGate := func(inputs []float64, rowWeights []float64, h float64, bias float64) float64 {
 			sum := bias
 			for i, val := range inputs {
@@ -618,7 +631,22 @@ func NewLSTMNeuron(
 			case cfg := <-n.ConfigUpdate:
 				// --- CONFIG UPDATE STEP ---
 				n.LR = cfg.LR
-				n.ClipValue = cfg.ClipValue // Clipping Threshold (Standard values are 1.0 or 5.0)
+				n.ClipValue = cfg.ClipValue
+				n.BatchSize = cfg.BatchSize
+				n.BatchCount = 0
+
+				// Preallocate Batch Accumulators
+				// Dimensions: [BatchSize][4 Gates][InputSize + 1]
+				n.BatchGradsW = make([][][]float64, cfg.BatchSize)
+				n.BatchGradsB = make([][]float64, cfg.BatchSize)
+
+				for i := range cfg.BatchSize {
+					n.BatchGradsW[i] = make([][]float64, 4)
+					n.BatchGradsB[i] = make([]float64, 4) // [4 Gates]
+					for gate := range 4 {
+						n.BatchGradsW[i][gate] = make([]float64, numInputs+1)
+					}
+				}
 				close(cfg.Ack)
 
 			case in := <-n.OutsFromPrev:
@@ -629,7 +657,7 @@ func NewLSTMNeuron(
 					// 2. Prepare State Object
 					st := statePool.Get().(*LSTMState)
 					st.X = make([]float64, numInputs)
-					copy(st.X, inputs) // Copy is crucial!
+					copy(st.X, inputs)
 					st.H_prev, st.C_prev = h_prev, c_prev
 
 					// 3. Calculate Gates
@@ -668,25 +696,25 @@ func NewLSTMNeuron(
 					}
 
 					// --- PHASE 2: BPTT CALCULATION ---
-
 					dh_next, dC_next := 0.0, 0.0
 
-					// Accumulators
+					// Local Gradients for this sequence
+					// Using explicit allocation here for clarity, relying on GC for these short-lived slices
+					// or you could use a sync.Pool for these too if pressure is high.
 					dW := make([][]float64, 4)
 					for i := range dW {
 						dW[i] = make([]float64, numInputs+1)
 					}
 					dB := make([]float64, 4)
 
-					// Buffer for errors to send backward (so we can send them 0->N later)
-					// dimensions: [timestep][input_neuron_index]
+					// Buffer for errors to send backward
 					dx_buffer := make([][]float64, timesteps)
 
 					historyCount := len(stack)
 
 					// Iterate Backwards
 					for t := historyCount - 1; t >= 0; t-- {
-						st := stack.Pop() // hcopy[t] //st := n.History[t]
+						st := stack.Pop()
 						err_spatial := incomingErrors[t]
 
 						dh_t := err_spatial + dh_next
@@ -701,16 +729,13 @@ func NewLSTMNeuron(
 
 						deltas := []float64{d_f, d_i, d_c_cand, d_o}
 
-						for idx, d := range deltas {
+						for _, d := range deltas {
 							if math.IsNaN(d) || math.IsInf(d, 0) {
-								fmt.Printf("CRITICAL: NaN detected at gate %d, timestep %d\n", idx, t)
-								fmt.Printf("Inputs: dh_t: %f, dC_t: %f, st.C_curr: %f\n", dh_t, dC_t, st.C_curr)
-								// Panic here to stop logs and see the state
-								panic("NaN Gradient")
+								panic("NaN Gradient in LSTM")
 							}
 						}
 
-						// Accumulate Gradients
+						// Accumulate Gradients for this sample
 						for gateIdx := range 4 {
 							d_gate := deltas[gateIdx]
 							for j := range numInputs {
@@ -723,7 +748,6 @@ func NewLSTMNeuron(
 						// Calculate dx for previous layer
 						dx_buffer[t] = make([]float64, numInputs)
 						for j := range numInputs {
-							// Access weights directly
 							dx_j := (d_f * n.Weights[0][j]) +
 								(d_i * n.Weights[1][j]) +
 								(d_c_cand * n.Weights[2][j]) +
@@ -740,41 +764,86 @@ func NewLSTMNeuron(
 							(d_o * n.Weights[3][lastCol])
 
 						dh_next = dh_prev_step
-						dC_next = dC_t * st.F_gate // Correct: C flows via Forget gate
+						dC_next = dC_t * st.F_gate
 
-						// Clean up
 						st.X = nil
 						statePool.Put(st)
 					}
 
 					// --- PHASE 3: ERROR PROPAGATION (CHRONOLOGICAL) ---
-					// Send buffered errors in order 0 -> N so the prev layer receives them correctly
 					for t := range historyCount {
 						for j := range numInputs {
 							n.ErrsToPrev[j] <- Synapse{ID: n.ID, Value: dx_buffer[t][j]}
 						}
 					}
 
-					// --- PHASE 4: WEIGHT UPDATE ---
-					for r := range 4 {
-						for c := range numInputs + 1 {
-							rawGrad := dW[r][c]
-							clippedGrad := clip(rawGrad, n.ClipValue)
-							n.Weights[r][c] -= n.LR * clippedGrad
+					// --- PHASE 4: UPDATE STRATEGY (BATCHING) ---
+
+					// Immediate Update (BatchSize == 1)
+					if n.BatchSize == 1 {
+						for r := range 4 {
+							for c := range numInputs + 1 {
+								// Clip and Update
+								n.Weights[r][c] -= n.LR * clip(dW[r][c], n.ClipValue)
+							}
+							n.Biases[r] -= n.LR * clip(dB[r], n.ClipValue)
 						}
-						rawBiasGrad := dB[r]
-						clippedBiasGrad := clip(rawBiasGrad, n.ClipValue)
-						n.Biases[r] -= n.LR * clippedBiasGrad
+					} else {
+						// Batch Accumulation
+						idx := n.BatchCount
+						for r := range 4 {
+							copy(n.BatchGradsW[idx][r], dW[r])
+							n.BatchGradsB[idx][r] = dB[r]
+						}
+						n.BatchCount++
+
+						// Batch Update Trigger
+						if n.BatchCount == n.BatchSize {
+							// 1. Reset Averages
+							for r := range 4 {
+								avgGradsB[r] = 0.0
+								for c := range numInputs + 1 {
+									avgGradsW[r][c] = 0.0
+								}
+							}
+
+							// 2. Sum Gradients
+							for b := range n.BatchSize {
+								for r := range 4 {
+									avgGradsB[r] += n.BatchGradsB[b][r]
+									for c := range numInputs + 1 {
+										avgGradsW[r][c] += n.BatchGradsW[b][r][c]
+									}
+								}
+							}
+
+							// 3. Average & Apply
+							batchFloat := float64(n.BatchSize)
+							for r := range 4 {
+								// Average Bias
+								avgB := avgGradsB[r] / batchFloat
+								n.Biases[r] -= n.LR * clip(avgB, n.ClipValue)
+
+								for c := range numInputs + 1 {
+									// Average Weight
+									avgW := avgGradsW[r][c] / batchFloat
+									n.Weights[r][c] -= n.LR * clip(avgW, n.ClipValue)
+								}
+							}
+
+							// 4. Reset Batch Count
+							n.BatchCount = 0
+						}
 					}
 
+					// --- CLEANUP ---
 					for j := range timesteps {
-						incomingErrors[j] = 0.0 // Zeroing the buffer
+						incomingErrors[j] = 0.0
 					}
 					errCounter = 0
 					timestep = 0
 				}
 			}
-
 		}
 	}()
 	return n
