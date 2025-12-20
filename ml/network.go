@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -65,7 +66,7 @@ func NewNetwork(defs ...LayerDef) *Network {
 	}
 
 	var iLayer *Layer
-	var prevErrs, prevIns [][]chan float64
+	var prevErrs, prevIns []chan Synapse
 	var hidden []*Layer
 
 	// 1. Handle the first layer (which defines the InputLayer structure)
@@ -244,18 +245,19 @@ func (nw *Network) LogAndSaveWeights(epoch int, totalLoss float64, correct int, 
 }
 
 func (nw *Network) GetOutput() []float64 {
-	numNeurons := len(nw.OutputLayer.InsToNext[0])
+	numNeurons := len(nw.OutputLayer.Neurons)
 
 	outputs := make([]float64, numNeurons)
-	for j := range numNeurons {
-		outputs[j] = <-nw.OutputLayer.InsToNext[0][j]
+	for range numNeurons {
+		outSyn := <-nw.OutputLayer.InsToNext[0]
+		outputs[outSyn.ID] = outSyn.Value
 	}
 	return outputs
 }
 
 func (nw *Network) FeedForward(x []float64) {
 	inputLayer := nw.InputLayer
-	
+
 	if len(nw.Hidden) == 0 {
 		panic("Network has no hidden layers.")
 	}
@@ -276,7 +278,7 @@ func (nw *Network) FeedForward(x []float64) {
 			for kernelIdx := range k {
 				// Map input x[start + k] to channel [filter][k]
 				val := x[startIdx+kernelIdx]
-				inputLayer.InsToNext[windowIdx][kernelIdx] <- val
+				inputLayer.InsToNext[windowIdx] <- Synapse{ID: kernelIdx, Value: val}
 			}
 		}
 
@@ -315,51 +317,55 @@ func (nw *Network) FeedForward(x []float64) {
 				flattenedIdx := (inRow * inputWidth) + inCol
 
 				val := x[flattenedIdx]
-				inputLayer.InsToNext[windowIdx][kernelIdx] <- val
+				inputLayer.InsToNext[windowIdx] <- Synapse{ID: kernelIdx, Value: val}
 			}
 		}
 
 	default:
 		m := len(inputLayer.InsToNext)
 		n := len(x)
-
+		wg := sync.WaitGroup{}
 		for neuronIdx := range m {
-			for inputIdx := range n {
-				// Copy input x[i] to every neuron's dedicated channel
-				inputLayer.InsToNext[neuronIdx][inputIdx] <- x[inputIdx]
-			}
+			wg.Add(1)
+			go func(ch chan Synapse){
+				defer wg.Done()
+				for inputIdx := range n {
+					ch <- Synapse{ID: inputIdx, Value: x[inputIdx]}
+				}
+			}(inputLayer.InsToNext[neuronIdx])
 		}
+		wg.Wait()
 	}
 }
 
 func (nw *Network) Feedback(pred []float64, target []float64) {
 	oLayer := nw.OutputLayer
-	numOutputNeurons := len(oLayer.InsToNext[0])
+	numOutputNeurons := len(oLayer.Neurons)
 
 	// Inject the final error into the output neurons to start backpropagation
 	for i := range numOutputNeurons {
-		oLayer.Neurons[i].ErrsFromNext[0] <- (pred[i] - target[i])
+		oLayer.Neurons[i].ErrsFromNext <- Synapse{ID: i, Value: pred[i] - target[i]}
 	}
 }
 
 func (nw *Network) WaitForBackpropFinish() {
 	iLayer := nw.InputLayer
 
-	// m is the number of rows/parallel inputs
 	m := len(iLayer.ErrsFromNext)
+	n := len(iLayer.InsToNext)
 
-	// n is the number of columns/features
-	if m == 0 || len(iLayer.ErrsFromNext[0]) == 0 {
-		panic("Should not happen in a valid network")
-	}
-	n := len(iLayer.ErrsFromNext[0])
-
+	wg := sync.WaitGroup{}
 	// Wait for the backpropagation signal on ALL m*n channels
 	for k := range m {
-		for j := range n {
-			<-iLayer.ErrsFromNext[k][j]
-		}
+		wg.Add(1)
+		go func(ch chan Synapse){
+			defer wg.Done()
+			for range n {
+				<-ch
+			}
+		}(iLayer.ErrsFromNext[k])
 	}
+	wg.Wait()
 }
 
 func (nw *Network) ResetLSTMState() {
@@ -399,38 +405,38 @@ func (nw *Network) Train(X [][]float64, Y any, cfg TrainingConfig) {
 // trainNonSequential handles standard, non-RNN training (Y is []float64).
 func (nw *Network) trainNonSequential(X [][]float64, Y []float64, cfg TrainingConfig, limit, dataSize int, start time.Time) {
 	for epoch := range cfg.Epochs {
-		totalLoss := 0.0
-		correct := 0
+        totalLoss := 0.0
+        correct := 0
 
-		if cfg.ShuffleData {
-			Shuffle(X, Y)
-		}
+        if cfg.ShuffleData {
+            Shuffle(X, Y)
+        }
 
 		for i := range limit {
-			x := X[i]
-			target := Y[i]
+            x := X[i]
+            target := Y[i]
 
-			// 1. Forward pass
-			nw.FeedForward(x)
-			pred := nw.GetOutput()
+            // 1. Forward pass
+            nw.FeedForward(x)
+            pred := nw.GetOutput()
 
-			// 2. Compute loss
-			loss, predVector, targetVector := nw.computeLoss(pred, target, cfg)
-			totalLoss += loss
+            // 2. Compute loss
+            loss, predVector, targetVector := nw.computeLoss(pred, target, cfg)
+            totalLoss += loss
 
-			// 3. Backward pass
-			nw.Feedback(predVector, targetVector)
-			nw.WaitForBackpropFinish()
+            // 3. Backward pass
+            nw.Feedback(predVector, targetVector)
+            nw.WaitForBackpropFinish() 
 
 			// 4. Accuracy Check
-			if nw.isCorrect(pred, target, cfg) {
-				correct++
-			}
-		}
+            if nw.isCorrect(pred, target, cfg) {
+                correct++
+            }
+        }
 
 		// Logging and Saving Weights
-		nw.LogAndSaveWeights(epoch, totalLoss, correct, limit, start, cfg)
-	}
+        nw.LogAndSaveWeights(epoch, totalLoss, correct, limit, start, cfg)
+    }
 }
 
 // trainSequential handles sequence (RNN/LSTM) training (Y is [][]float64).

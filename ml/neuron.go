@@ -30,16 +30,22 @@ var activationMap = map[string]struct {
 type ActivationFunc func(float64) float64
 type InitializerFunc func([]float64, int, int)
 
+type Synapse struct {
+	ID    int
+	Value float64
+}
+
 type Neuron struct {
+	ID      int
 	Weights []float64
 	Bias    float64
 	LR      float64
 
-	ErrsToPrev   []chan float64 // send error backward to all neurons of previous layer connected to this neuron : write
-	ErrsFromNext []chan float64 // receive error from layer in front, from each neuron to which this neuron is connected to : read
+	ErrsToPrev   []chan Synapse // send error backward to all neurons of previous layer connected to this neuron : write
+	ErrsFromNext chan Synapse   // receive error from layer in front, from each neuron to which this neuron is connected to : read
 
-	OutsFromPrev []chan float64 // activated outputs from prev layer, outputs from all neurons of previos layer connected to this neuron  : read
-	InsToNext    []chan float64 // activated outputs to next layer, send output to all the neurons in the next layer to which this neuron is connected to : write
+	OutsFromPrev chan Synapse   // activated outputs from prev layer, outputs from all neurons of previos layer connected to this neuron  : read
+	InsToNext    []chan Synapse // activated outputs to next layer, send output to all the neurons in the next layer to which this neuron is connected to : write
 
 	BatchSize   int         // Stores the batch size
 	BatchGradsW [][]float64 // To accumulate dL/dW for each sample in the batch
@@ -54,10 +60,10 @@ type EmbeddingNeuron struct {
 	LR         float64
 	VocabSize  int // Stored for internal access in the goroutine
 
-	ErrsToPrev   []chan float64   // [InputLen] channels to send error backward to input layer
-	ErrsFromNext [][]chan float64 // [NextNeurons x OutputDim] channels to receive error from next layer
-	OutsFromPrev []chan float64   // [InputLen] channels to receive word indices
-	InsToNext    [][]chan float64 // [NextNeurons x OutputDim] channels to send flattened embeddings
+	ErrsToPrev   []chan Synapse // [InputLen] channels to send error backward to input layer
+	ErrsFromNext chan Synapse   // [NextNeurons x OutputDim] channels to receive error from next layer
+	OutsFromPrev chan Synapse   // [InputLen] channels to receive word indices
+	InsToNext    []chan Synapse // [NextNeurons x OutputDim] channels to send flattened embeddings
 
 	// Batching fields for accumulation
 	BatchSize  int
@@ -71,6 +77,7 @@ type EmbeddingNeuron struct {
 }
 
 type LSTMNeuron struct {
+	ID int
 	// Weights: 2D Array [4 Rows][InputSize + 1 Col]
 	// Rows: 0=Forget, 1=Input, 2=Candidate, 3=Output
 	// Cols: 0..M-1 are Input Weights, Last Col is Hidden Weight
@@ -81,13 +88,13 @@ type LSTMNeuron struct {
 	ClipValue float64 // Gradient Clipping Value
 
 	// Communication Channels
-	ErrsToPrev   []chan float64 // Write to previous layer
-	ErrsFromNext []chan float64 // Read from next layer
-	OutsFromPrev []chan float64 // Read from previous layer
-	InsToNext    []chan float64 // Write to next layer
+	ErrsToPrev   []chan Synapse // Write to previous layer
+	ErrsFromNext chan Synapse   // Read from next layer
+	OutsFromPrev chan Synapse   // Read from previous layer
+	InsToNext    []chan Synapse // Write to next layer
 
 	// Signal to reset hidden state between sequences
-	ResetChan chan ResetState
+	ResetChan    chan ResetState
 	ConfigUpdate chan NeuronCfg
 }
 
@@ -154,9 +161,18 @@ func (s *HistoryStack) Pop() *LSTMState {
 	return v
 }
 
-func NewNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan float64, f, df ActivationFunc, init InitializerFunc) *Neuron {
+func NewNeuron(
+	id int,
+	errsToPrev []chan Synapse,
+	outsFromPrev chan Synapse,
+	errsFromNext chan Synapse,
+	insToNext []chan Synapse,
+	f, df ActivationFunc,
+	init InitializerFunc,
+) *Neuron {
 	n := &Neuron{
-		Weights:      make([]float64, len(outsFromPrev)),
+		ID:           id,
+		Weights:      make([]float64, len(errsToPrev)),
 		Bias:         0.0,
 		ErrsToPrev:   errsToPrev,
 		ErrsFromNext: errsFromNext,
@@ -166,7 +182,7 @@ func NewNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan float64,
 	}
 
 	// Init weights
-	init(n.Weights, len(n.OutsFromPrev), len(n.InsToNext))
+	init(n.Weights, len(n.ErrsToPrev), len(n.InsToNext))
 
 	// Queue for knowledge
 	queue := make(KnowledgeQueue, 0, ChannelCapacity) // Preallocate capacity so there is no memory reallocation
@@ -195,7 +211,13 @@ func NewNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan float64,
 	}
 
 	go func() {
-		in := make([]float64, len(outsFromPrev))
+		// Forward pass
+		inBuf := make([]float64, len(errsToPrev))
+		inCounter := 0
+		// Backward pass
+		errFront := 0.0
+		errCounter := 0
+		// Gradient accumulators for batching
 		avgBiasGrad := 0.0
 		avgWeightsGrads := make([]float64, len(n.Weights))
 
@@ -211,88 +233,96 @@ func NewNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan float64,
 					n.BatchGradsW[i] = make([]float64, len(n.Weights))
 				}
 				close(cfg.Ack)
-			case i0 := <-n.OutsFromPrev[0]:
-				in[0] = i0
-				for i := 1; i < len(n.OutsFromPrev); i++ {
-					in[i] = <-n.OutsFromPrev[i]
-				}
-				out := Activate(in)
-				for i := range len(n.InsToNext) {
-					n.InsToNext[i] <- out
-				}
-			case e0 := <-n.ErrsFromNext[0]:
-				// Retrieve Knowledge from queue
-				kw := queue.Pop()
-				grad := df(kw.T)
 
-				// wait for all incoming errors from front layer
-				errFront := e0
-				for i := 1; i < len(n.ErrsFromNext); i++ {
-					errFront += <-n.ErrsFromNext[i]
-				}
-
-				// send error backward = w_current * grad(t) * errFront
-				for i := range n.ErrsToPrev {
-					n.ErrsToPrev[i] <- grad * n.Weights[i] * errFront
-				}
-
-				if n.BatchSize == 1 {
-					for i := range n.Weights {
-						n.Weights[i] -= n.LR * grad * kw.Input[i] * errFront
+			case in := <-n.OutsFromPrev:
+				inBuf[in.ID] = in.Value
+				inCounter++
+				if inCounter == len(errsToPrev) {
+					inCounter = 0
+					out := Activate(inBuf)
+					for i := range len(n.InsToNext) {
+						n.InsToNext[i] <- Synapse{ID: n.ID, Value: out}
 					}
-					n.Bias -= n.LR * grad * errFront
-
-					// Return Knowledge struct to pool immediately
-					kw.Input = nil
-					kw.T = 0.0
-					knowledgePool.Put(kw)
-					continue
 				}
 
-				// --- ACCUMULATION STEP (per sample) ---
-				sampleIndex := n.BatchCount
+			case err := <-n.ErrsFromNext:
+				errFront += err.Value
+				errCounter++
+				// wait for all incoming errors from front layer
+				if errCounter == len(n.InsToNext) {
+					// Retrieve Knowledge from queue
+					kw := queue.Pop()
+					grad := df(kw.T)
 
-				n.BatchGradB[sampleIndex] = grad * errFront
-				for i := range n.Weights {
-					n.BatchGradsW[sampleIndex][i] = grad * kw.Input[i] * errFront
-				}
+					// send error backward = w_current * grad(t) * errFront
+					for i := range n.ErrsToPrev {
+						n.ErrsToPrev[i] <- Synapse{ID: n.ID, Value: grad * n.Weights[i] * errFront}
+					}
 
-				n.BatchCount++
-				// --- END ACCUMULATION STEP ---
+					if n.BatchSize == 1 {
+						for i := range n.Weights {
+							n.Weights[i] -= n.LR * grad * kw.Input[i] * errFront
+						}
+						n.Bias -= n.LR * grad * errFront
 
-				// --- BATCH UPDATE STEP ---
-				if n.BatchCount == n.BatchSize {
-					// 1. Calculate averages
-					for i := range n.BatchSize {
-						avgBiasGrad += n.BatchGradB[i]
+						// Return Knowledge struct to pool immediately
+						kw.Input = nil
+						kw.T = 0.0
+						knowledgePool.Put(kw)
+
+						errCounter = 0
+						errFront = 0.0
+						continue
+					}
+
+					// --- ACCUMULATION STEP (per sample) ---
+					sampleIndex := n.BatchCount
+
+					n.BatchGradB[sampleIndex] = grad * errFront
+					for i := range n.Weights {
+						n.BatchGradsW[sampleIndex][i] = grad * kw.Input[i] * errFront
+					}
+
+					n.BatchCount++
+					// --- END ACCUMULATION STEP ---
+
+					// --- BATCH UPDATE STEP ---
+					if n.BatchCount == n.BatchSize {
+						// 1. Calculate averages
+						for i := range n.BatchSize {
+							avgBiasGrad += n.BatchGradB[i]
+							for j := range n.Weights {
+								avgWeightsGrads[j] += n.BatchGradsW[i][j]
+							}
+						}
+						avgBiasGrad /= float64(n.BatchSize)
 						for j := range n.Weights {
-							avgWeightsGrads[j] += n.BatchGradsW[i][j]
+							avgWeightsGrads[j] /= float64(n.BatchSize)
+						}
+
+						// 2. Update weights and bias (using the average gradients)
+						for i := range n.Weights {
+							n.Weights[i] -= n.LR * avgWeightsGrads[i]
+						}
+						n.Bias -= n.LR * avgBiasGrad
+
+						// 3. Reset batch counter
+						n.BatchCount = 0
+						avgBiasGrad = 0.0
+						for j := range n.Weights {
+							avgWeightsGrads[j] = 0.0
 						}
 					}
-					avgBiasGrad /= float64(n.BatchSize)
-					for j := range n.Weights {
-						avgWeightsGrads[j] /= float64(n.BatchSize)
-					}
+					// --- END BATCH UPDATE STEP ---
 
-					// 2. Update weights and bias (using the average gradients)
-					for i := range n.Weights {
-						n.Weights[i] -= n.LR * avgWeightsGrads[i]
-					}
-					n.Bias -= n.LR * avgBiasGrad
+					// Return Knowledge struct to pool
+					kw.Input = nil // Clear reference to reusable input slice for safety
+					kw.T = 0.0
+					knowledgePool.Put(kw)
 
-					// 3. Reset batch counter
-					n.BatchCount = 0
-					avgBiasGrad = 0.0
-					for j := range n.Weights {
-						avgWeightsGrads[j] = 0.0
-					}
+					errCounter = 0
+					errFront = 0.0
 				}
-				// --- END BATCH UPDATE STEP ---
-
-				// Return Knowledge struct to pool
-				kw.Input = nil // Clear reference to reusable input slice for safety
-				kw.T = 0.0
-				knowledgePool.Put(kw)
 			}
 		}
 	}()
@@ -305,10 +335,10 @@ func NewEmbeddingNeuron(
 	embedDim int,
 	vocabSize int,
 	inputLen int,
-	errsToPrev []chan float64,
-	errsFromNext [][]chan float64,
-	outsFromPrev []chan float64,
-	insToNext [][]chan float64,
+	errsToPrev []chan Synapse,
+	errsFromNext chan Synapse,
+	outsFromPrev chan Synapse,
+	insToNext []chan Synapse,
 	initializer InitializerFunc,
 ) *EmbeddingNeuron {
 	en := &EmbeddingNeuron{
@@ -352,13 +382,14 @@ func NewEmbeddingNeuron(
 	go func() {
 		// GC Optimization: Allocate reusable buffers ONCE inside the goroutine scope
 		inputIndices := make([]float64, en.InputLen)
+		inCounter := 0
+
 		outputDim := en.InputLen * en.EmbedDim
 		embeddings := make([]float64, outputDim)
 
 		// GC Optimization: Allocate reusable error buffer ONCE
-		m := len(en.ErrsFromNext)
-		n := len(en.ErrsFromNext[0])
-		errFrontVec := make([]float64, n) // Reusable buffer for aggregated errors
+		errFrontVec := make([]float64, outputDim) // Reusable buffer for aggregated errors
+		errCounter := 0
 		for {
 			select {
 			case cfg := <-en.ConfigUpdate:
@@ -371,71 +402,81 @@ func NewEmbeddingNeuron(
 				}
 				en.BatchUsage = make([]int, en.VocabSize)
 				close(cfg.Ack)
-			case i0 := <-en.OutsFromPrev[0]:
+			case in := <-en.OutsFromPrev:
 				// 1. Read all input indices into the persistent buffer
-				inputIndices[0] = i0
-				for i := 1; i < en.InputLen; i++ {
-					inputIndices[i] = <-en.OutsFromPrev[i]
-				}
+				inputIndices[in.ID] = in.Value
+				inCounter++
+				if inCounter == en.InputLen {
+					// 2. Get the embeddings and flatten
+					for i, index := range inputIndices {
+						idx := int(index)
+						if idx < 0 || idx >= en.VocabSize {
+							log.Printf("Warning: Word index %.4f out of bounds (0-%d)\n", index, en.VocabSize-1)
+							continue
+						}
 
-				// 2. Get the embeddings and flatten
-				for i, index := range inputIndices {
-					idx := int(index)
-					if idx < 0 || idx >= en.VocabSize {
-						log.Printf("Warning: Word index %.4f out of bounds (0-%d)\n", index, en.VocabSize-1)
+						// Copy the embedding vector into the persistent output buffer
+						srcVec := en.Embeddings[idx]
+						copy(embeddings[i*en.EmbedDim:(i+1)*en.EmbedDim], srcVec)
+					}
+
+					// 3. Store indices for backward pass (using the pooled struct)
+					kw := knowledgePool.Get().(*Knowledge)
+					kw.Input = slices.Clone(inputIndices) // Pass a copy of the input indices
+
+					queue.Push(kw)
+
+					// 4. Send flattened outputs to next layer
+					m := len(en.InsToNext)
+					n := outputDim // len(en.InsToNext[0])
+
+					for k := range m {
+						for j := range n {
+							en.InsToNext[k] <- Synapse{ID: j, Value: embeddings[j]}
+						}
+					}
+					inCounter = 0
+				}
+			case err := <-en.ErrsFromNext:
+				errFrontVec[err.ID] += err.Value
+				errCounter++
+
+				if errCounter == len(en.InsToNext)*outputDim {
+					kw := queue.Pop()
+
+					// 3. Send backpropagation finish signal (InputLen signals, e.g., 5)
+					for i := range en.ErrsToPrev {
+						en.ErrsToPrev[i] <- Synapse{ID: 1, Value: 1.0} // Signal finish
+					}
+
+					// --- SGD UPDATE (BatchSize == 1) ---
+					if en.BatchSize == 1 {
+						for i, index := range kw.Input {
+							idx := int(index)
+							if idx < 0 || idx >= en.VocabSize {
+								continue
+							}
+
+							gradSlice := errFrontVec[i*en.EmbedDim : (i+1)*en.EmbedDim]
+							// Update the embedding vector immediately (SGD)
+							for j := range en.EmbedDim {
+								en.Embeddings[idx][j] -= en.LR * gradSlice[j]
+							}
+						}
+
+						// Return Knowledge struct to pool
+						kw.Input = nil
+						knowledgePool.Put(kw)
+
+						for j := range outputDim {
+							errFrontVec[j] = 0.0 // Zeroing the buffer
+						}
+						errCounter = 0
 						continue
 					}
+					// --- END SGD UPDATE ---
 
-					// Copy the embedding vector into the persistent output buffer
-					srcVec := en.Embeddings[idx]
-					copy(embeddings[i*en.EmbedDim:(i+1)*en.EmbedDim], srcVec)
-				}
-
-				// 3. Store indices for backward pass (using the pooled struct)
-				kw := knowledgePool.Get().(*Knowledge)
-				kw.Input = slices.Clone(inputIndices) // Pass a copy of the input indices
-
-				queue.Push(kw)
-
-				// 4. Send flattened outputs to next layer
-				m := len(en.InsToNext)
-				n := len(en.InsToNext[0])
-
-				for k := range m {
-					for j := range n {
-						en.InsToNext[k][j] <- embeddings[j]
-					}
-				}
-			case e00 := <-en.ErrsFromNext[0][0]:
-				kw := queue.Pop()
-				for j := range n {
-					errFrontVec[j] = 0.0 // Zeroing the buffer
-				}
-				errFrontVec[0] += e00
-
-				// --- 2. Read the remainder of the first row (k=0, j=1 to N-1) ---
-				// This loop blocks sequentially.
-				for j := 1; j < n; j++ {
-					// Read the remaining channels in the first row.
-					errFrontVec[j] += <-en.ErrsFromNext[0][j]
-				}
-
-				// --- 3. Read all subsequent rows (k=1 to M-1) ---
-				// This loop blocks sequentially for all subsequent error sources.
-				for k := 1; k < m; k++ {
-					for j := range n {
-						// Read all channels from the remaining rows.
-						errFrontVec[j] += <-en.ErrsFromNext[k][j]
-					}
-				}
-
-				// 3. Send backpropagation finish signal (InputLen signals, e.g., 5)
-				for i := range en.ErrsToPrev {
-					en.ErrsToPrev[i] <- 1.0 // Signal finish
-				}
-
-				// --- SGD UPDATE (BatchSize == 1) ---
-				if en.BatchSize == 1 {
+					// --- ACCUMULATION STEP (for batch size > 1) ---
 					for i, index := range kw.Input {
 						idx := int(index)
 						if idx < 0 || idx >= en.VocabSize {
@@ -443,76 +484,70 @@ func NewEmbeddingNeuron(
 						}
 
 						gradSlice := errFrontVec[i*en.EmbedDim : (i+1)*en.EmbedDim]
-						// Update the embedding vector immediately (SGD)
+
+						// Accumulate gradient sum and usage count
 						for j := range en.EmbedDim {
-							en.Embeddings[idx][j] -= en.LR * gradSlice[j]
+							en.BatchGrads[idx][j] += gradSlice[j]
 						}
+						en.BatchUsage[idx]++
 					}
+
+					en.BatchCount++
+					// --- END ACCUMULATION STEP ---
+
+					// --- BATCH UPDATE STEP ---
+					if en.BatchCount == en.BatchSize {
+						// Apply the average gradient to all affected embeddings
+						for idx := range en.VocabSize {
+							if en.BatchUsage[idx] > 0 {
+								// Update the embedding vector using the average gradient
+								count := float64(en.BatchUsage[idx])
+								for j := range en.EmbedDim {
+									avgGrad := en.BatchGrads[idx][j] / count
+									en.Embeddings[idx][j] -= en.LR * avgGrad
+								}
+							}
+
+							// Reset accumulation for the next batch (Zero out existing buffers)
+							for j := range en.EmbedDim {
+								en.BatchGrads[idx][j] = 0.0
+							}
+							en.BatchUsage[idx] = 0
+						}
+
+						// Reset batch counter
+						en.BatchCount = 0
+					}
+					// --- END BATCH UPDATE STEP ---
 
 					// Return Knowledge struct to pool
-					kw.Input = nil
+					kw.Input = nil // Clear reference to reusable input slice for safety
 					knowledgePool.Put(kw)
-					continue
-				}
-				// --- END SGD UPDATE ---
 
-				// --- ACCUMULATION STEP (for batch size > 1) ---
-				for i, index := range kw.Input {
-					idx := int(index)
-					if idx < 0 || idx >= en.VocabSize {
-						continue
+					for j := range outputDim {
+						errFrontVec[j] = 0.0 // Zeroing the buffer
 					}
-
-					gradSlice := errFrontVec[i*en.EmbedDim : (i+1)*en.EmbedDim]
-
-					// Accumulate gradient sum and usage count
-					for j := range en.EmbedDim {
-						en.BatchGrads[idx][j] += gradSlice[j]
-					}
-					en.BatchUsage[idx]++
+					errCounter = 0
 				}
-
-				en.BatchCount++
-				// --- END ACCUMULATION STEP ---
-
-				// --- BATCH UPDATE STEP ---
-				if en.BatchCount == en.BatchSize {
-					// Apply the average gradient to all affected embeddings
-					for idx := range en.VocabSize {
-						if en.BatchUsage[idx] > 0 {
-							// Update the embedding vector using the average gradient
-							count := float64(en.BatchUsage[idx])
-							for j := range en.EmbedDim {
-								avgGrad := en.BatchGrads[idx][j] / count
-								en.Embeddings[idx][j] -= en.LR * avgGrad
-							}
-						}
-
-						// Reset accumulation for the next batch (Zero out existing buffers)
-						for j := range en.EmbedDim {
-							en.BatchGrads[idx][j] = 0.0
-						}
-						en.BatchUsage[idx] = 0
-					}
-
-					// Reset batch counter
-					en.BatchCount = 0
-				}
-				// --- END BATCH UPDATE STEP ---
-
-				// Return Knowledge struct to pool
-				kw.Input = nil // Clear reference to reusable input slice for safety
-				knowledgePool.Put(kw)
 			}
 		}
 	}()
 	return en
 }
 
-func NewLSTMNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan float64, timesteps int, initializer InitializerFunc) *LSTMNeuron {
-	inputSize := len(outsFromPrev)
+func NewLSTMNeuron(
+	id int,
+	errsToPrev []chan Synapse,
+	outsFromPrev chan Synapse,
+	errsFromNext chan Synapse,
+	insToNext []chan Synapse,
+	timesteps int,
+	initializer InitializerFunc,
+) *LSTMNeuron {
+	inputSize := len(errsToPrev)
 
 	n := &LSTMNeuron{
+		ID:           id,
 		Weights:      make([][]float64, 4),
 		Biases:       make([]float64, 4),
 		ErrsToPrev:   errsToPrev,
@@ -526,7 +561,7 @@ func NewLSTMNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan floa
 	// Initialize Weights (4 Gates)
 	for i := range 4 {
 		n.Weights[i] = make([]float64, inputSize+1)
-		initializer(n.Weights[i], len(n.OutsFromPrev), len(n.InsToNext))
+		initializer(n.Weights[i], len(n.ErrsToPrev), len(n.InsToNext))
 		n.Biases[i] = 0.0
 	}
 
@@ -556,8 +591,13 @@ func NewLSTMNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan floa
 
 	go func() {
 		h_prev, c_prev := 0.0, 0.0
-		numInputs := len(n.OutsFromPrev)
+		numInputs := len(n.ErrsToPrev)
 		inputs := make([]float64, numInputs)
+		inCounter := 0
+
+		incomingErrors := make([]float64, timesteps)
+		timestep := 0
+		errCounter := 0
 
 		calculateGate := func(inputs []float64, rowWeights []float64, h float64, bias float64) float64 {
 			sum := bias
@@ -574,165 +614,164 @@ func NewLSTMNeuron(errsToPrev, outsFromPrev, errsFromNext, insToNext []chan floa
 				h_prev, c_prev = 0.0, 0.0
 				stack = stack[:0] // Clear the stack history
 				close(r.Ack)
+
 			case cfg := <-n.ConfigUpdate:
 				// --- CONFIG UPDATE STEP ---
 				n.LR = cfg.LR
 				n.ClipValue = cfg.ClipValue // Clipping Threshold (Standard values are 1.0 or 5.0)
 				close(cfg.Ack)
-			case i0 := <-n.OutsFromPrev[0]:
-				inputs[0] = i0
-				for i := 1; i < numInputs; i++ {
-					inputs[i] = <-n.OutsFromPrev[i]
-				}
-				// 2. Prepare State Object
-				st := statePool.Get().(*LSTMState)
-				st.X = make([]float64, numInputs)
-				copy(st.X, inputs) // Copy is crucial!
-				st.H_prev, st.C_prev = h_prev, c_prev
 
-				// 3. Calculate Gates
-				st.F_gate = sigmoid(calculateGate(inputs, n.Weights[0], h_prev, n.Biases[0]))
-				st.I_gate = sigmoid(calculateGate(inputs, n.Weights[1], h_prev, n.Biases[1]))
-				st.C_cand = tanh(calculateGate(inputs, n.Weights[2], h_prev, n.Biases[2]))
-				st.O_gate = sigmoid(calculateGate(inputs, n.Weights[3], h_prev, n.Biases[3]))
+			case in := <-n.OutsFromPrev:
+				inputs[in.ID] = in.Value
+				inCounter++
 
-				// 4. Update Memory
-				st.C_curr = (st.F_gate * c_prev) + (st.I_gate * st.C_cand)
-				st.H_curr = st.O_gate * tanh(st.C_curr)
+				if inCounter == len(n.ErrsToPrev) {
+					// 2. Prepare State Object
+					st := statePool.Get().(*LSTMState)
+					st.X = make([]float64, numInputs)
+					copy(st.X, inputs) // Copy is crucial!
+					st.H_prev, st.C_prev = h_prev, c_prev
 
-				// 5. Store History
-				stack.Push(st)
+					// 3. Calculate Gates
+					st.F_gate = sigmoid(calculateGate(inputs, n.Weights[0], h_prev, n.Biases[0]))
+					st.I_gate = sigmoid(calculateGate(inputs, n.Weights[1], h_prev, n.Biases[1]))
+					st.C_cand = tanh(calculateGate(inputs, n.Weights[2], h_prev, n.Biases[2]))
+					st.O_gate = sigmoid(calculateGate(inputs, n.Weights[3], h_prev, n.Biases[3]))
 
-				// 6. Update Loop State
-				h_prev, c_prev = st.H_curr, st.C_curr
+					// 4. Update Memory
+					st.C_curr = (st.F_gate * c_prev) + (st.I_gate * st.C_cand)
+					st.H_curr = st.O_gate * tanh(st.C_curr)
 
-				// 7. Send Output
-				for _, ch := range n.InsToNext {
-					ch <- st.H_curr
-				}
-			case e0 := <-n.ErrsFromNext[0]:
-				incomingErrors := make([]float64, timesteps)
-				incomingErrors[0] = e0
-				for i := 1; i < len(n.ErrsFromNext); i++ {
-					val := <-n.ErrsFromNext[i]
-					if math.IsNaN(val) || math.IsInf(val, 0) {
-						panic(fmt.Sprintf("LSTM Received NaN error from Output Layer at timestep %d", 0))
+					// 5. Store History
+					stack.Push(st)
+
+					// 6. Update Loop State
+					h_prev, c_prev = st.H_curr, st.C_curr
+
+					// 7. Send Output
+					for _, ch := range n.InsToNext {
+						ch <- Synapse{ID: n.ID, Value: st.H_curr}
 					}
-					// sumErr += <-ch
-					incomingErrors[0] += val
+					inCounter = 0
 				}
 
-				// Collect remaining errors (Assumes Order 0 -> N)
-				for t := 1; t < timesteps; t++ {
-					sumErr := 0.0
-					for _, ch := range n.ErrsFromNext {
-						val := <-ch
-						if math.IsNaN(val) || math.IsInf(val, 0) {
-							panic(fmt.Sprintf("LSTM Received NaN error from Output Layer at timestep %d", t))
+			case err := <-n.ErrsFromNext:
+				incomingErrors[timestep] += err.Value
+				errCounter++
+
+				if errCounter == len(n.InsToNext) {
+					timestep++
+
+					if timestep < timesteps {
+						errCounter = 0
+						continue
+					}
+
+					// --- PHASE 2: BPTT CALCULATION ---
+
+					dh_next, dC_next := 0.0, 0.0
+
+					// Accumulators
+					dW := make([][]float64, 4)
+					for i := range dW {
+						dW[i] = make([]float64, numInputs+1)
+					}
+					dB := make([]float64, 4)
+
+					// Buffer for errors to send backward (so we can send them 0->N later)
+					// dimensions: [timestep][input_neuron_index]
+					dx_buffer := make([][]float64, timesteps)
+
+					historyCount := len(stack)
+
+					// Iterate Backwards
+					for t := historyCount - 1; t >= 0; t-- {
+						st := stack.Pop() // hcopy[t] //st := n.History[t]
+						err_spatial := incomingErrors[t]
+
+						dh_t := err_spatial + dh_next
+
+						tanh_C := tanh(st.C_curr)
+						d_o := dh_t * tanh_C * dsigmoid(st.O_gate)
+						dC_t := (dh_t * st.O_gate * dtanh(tanh_C)) + dC_next
+
+						d_c_cand := dC_t * st.I_gate * dtanh(st.C_cand)
+						d_i := dC_t * st.C_cand * dsigmoid(st.I_gate)
+						d_f := dC_t * st.C_prev * dsigmoid(st.F_gate)
+
+						deltas := []float64{d_f, d_i, d_c_cand, d_o}
+
+						for idx, d := range deltas {
+							if math.IsNaN(d) || math.IsInf(d, 0) {
+								fmt.Printf("CRITICAL: NaN detected at gate %d, timestep %d\n", idx, t)
+								fmt.Printf("Inputs: dh_t: %f, dC_t: %f, st.C_curr: %f\n", dh_t, dC_t, st.C_curr)
+								// Panic here to stop logs and see the state
+								panic("NaN Gradient")
+							}
 						}
-						sumErr += val
-					}
-					incomingErrors[t] = sumErr
-				}
 
-				// --- PHASE 2: BPTT CALCULATION ---
-
-				dh_next, dC_next := 0.0, 0.0
-
-				// Accumulators
-				dW := make([][]float64, 4)
-				for i := range dW {
-					dW[i] = make([]float64, numInputs+1)
-				}
-				dB := make([]float64, 4)
-
-				// Buffer for errors to send backward (so we can send them 0->N later)
-				// dimensions: [timestep][input_neuron_index]
-				dx_buffer := make([][]float64, timesteps)
-
-				historyCount := len(stack)
-
-				// Iterate Backwards
-				for t := historyCount - 1; t >= 0; t-- {
-					st := stack.Pop() // hcopy[t] //st := n.History[t]
-					err_spatial := incomingErrors[t]
-
-					dh_t := err_spatial + dh_next
-
-					tanh_C := tanh(st.C_curr)
-					d_o := dh_t * tanh_C * dsigmoid(st.O_gate)
-					dC_t := (dh_t * st.O_gate * dtanh(tanh_C)) + dC_next
-
-					d_c_cand := dC_t * st.I_gate * dtanh(st.C_cand)
-					d_i := dC_t * st.C_cand * dsigmoid(st.I_gate)
-					d_f := dC_t * st.C_prev * dsigmoid(st.F_gate)
-
-					deltas := []float64{d_f, d_i, d_c_cand, d_o}
-
-					for idx, d := range deltas {
-						if math.IsNaN(d) || math.IsInf(d, 0) {
-							fmt.Printf("CRITICAL: NaN detected at gate %d, timestep %d\n", idx, t)
-							fmt.Printf("Inputs: dh_t: %f, dC_t: %f, st.C_curr: %f\n", dh_t, dC_t, st.C_curr)
-							// Panic here to stop logs and see the state
-							panic("NaN Gradient")
+						// Accumulate Gradients
+						for gateIdx := range 4 {
+							d_gate := deltas[gateIdx]
+							for j := range numInputs {
+								dW[gateIdx][j] += d_gate * st.X[j]
+							}
+							dW[gateIdx][numInputs] += d_gate * st.H_prev
+							dB[gateIdx] += d_gate
 						}
-					}
 
-					// Accumulate Gradients
-					for gateIdx := range 4 {
-						d_gate := deltas[gateIdx]
+						// Calculate dx for previous layer
+						dx_buffer[t] = make([]float64, numInputs)
 						for j := range numInputs {
-							dW[gateIdx][j] += d_gate * st.X[j]
+							// Access weights directly
+							dx_j := (d_f * n.Weights[0][j]) +
+								(d_i * n.Weights[1][j]) +
+								(d_c_cand * n.Weights[2][j]) +
+								(d_o * n.Weights[3][j])
+
+							dx_buffer[t][j] = dx_j
 						}
-						dW[gateIdx][numInputs] += d_gate * st.H_prev
-						dB[gateIdx] += d_gate
+
+						// Temporal Error
+						lastCol := numInputs
+						dh_prev_step := (d_f * n.Weights[0][lastCol]) +
+							(d_i * n.Weights[1][lastCol]) +
+							(d_c_cand * n.Weights[2][lastCol]) +
+							(d_o * n.Weights[3][lastCol])
+
+						dh_next = dh_prev_step
+						dC_next = dC_t * st.F_gate // Correct: C flows via Forget gate
+
+						// Clean up
+						st.X = nil
+						statePool.Put(st)
 					}
 
-					// Calculate dx for previous layer
-					dx_buffer[t] = make([]float64, numInputs)
-					for j := range numInputs {
-						// Access weights directly
-						dx_j := (d_f * n.Weights[0][j]) +
-							(d_i * n.Weights[1][j]) +
-							(d_c_cand * n.Weights[2][j]) +
-							(d_o * n.Weights[3][j])
-
-						dx_buffer[t][j] = dx_j
+					// --- PHASE 3: ERROR PROPAGATION (CHRONOLOGICAL) ---
+					// Send buffered errors in order 0 -> N so the prev layer receives them correctly
+					for t := range historyCount {
+						for j := range numInputs {
+							n.ErrsToPrev[j] <- Synapse{ID: n.ID, Value: dx_buffer[t][j]}
+						}
 					}
 
-					// Temporal Error
-					lastCol := numInputs
-					dh_prev_step := (d_f * n.Weights[0][lastCol]) +
-						(d_i * n.Weights[1][lastCol]) +
-						(d_c_cand * n.Weights[2][lastCol]) +
-						(d_o * n.Weights[3][lastCol])
-
-					dh_next = dh_prev_step
-					dC_next = dC_t * st.F_gate // Correct: C flows via Forget gate
-
-					// Clean up
-					st.X = nil
-					statePool.Put(st)
-				}
-
-				// --- PHASE 3: ERROR PROPAGATION (CHRONOLOGICAL) ---
-				// Send buffered errors in order 0 -> N so the prev layer receives them correctly
-				for t := range historyCount {
-					for j := range numInputs {
-						n.ErrsToPrev[j] <- dx_buffer[t][j]
+					// --- PHASE 4: WEIGHT UPDATE ---
+					for r := range 4 {
+						for c := range numInputs + 1 {
+							rawGrad := dW[r][c]
+							clippedGrad := clip(rawGrad, n.ClipValue)
+							n.Weights[r][c] -= n.LR * clippedGrad
+						}
+						rawBiasGrad := dB[r]
+						clippedBiasGrad := clip(rawBiasGrad, n.ClipValue)
+						n.Biases[r] -= n.LR * clippedBiasGrad
 					}
-				}
 
-				// --- PHASE 4: WEIGHT UPDATE ---
-				for r := range 4 {
-					for c := range numInputs + 1 {
-						rawGrad := dW[r][c]
-						clippedGrad := clip(rawGrad, n.ClipValue)
-						n.Weights[r][c] -= n.LR * clippedGrad
+					for j := range timesteps {
+						incomingErrors[j] = 0.0 // Zeroing the buffer
 					}
-					rawBiasGrad := dB[r]
-					clippedBiasGrad := clip(rawBiasGrad, n.ClipValue)
-					n.Biases[r] -= n.LR * clippedBiasGrad
+					errCounter = 0
+					timestep = 0
 				}
 			}
 
